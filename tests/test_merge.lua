@@ -282,6 +282,66 @@ test('multiple items: mixed operations', function()
 end)
 
 -------------------------------------------------------------------------------
+puts('\nvim.NIL / serialization determinism')
+-------------------------------------------------------------------------------
+
+test('vim.NIL fields treated as absent (noop)', function()
+    local base = {
+        { id = 'x', text = 'test', done = false, created_at = 100, notes = vim.NIL },
+    }
+    local local_ = {
+        { id = 'x', text = 'test', done = false, created_at = 100 },
+    }
+    local remote = {
+        { id = 'x', text = 'test', done = false, created_at = 100, notes = vim.NIL },
+    }
+    local merged, report = merge.merge(base, local_, remote)
+    assert(report.is_noop == true, 'expected noop')
+    assert(report.unchanged == 1, 'expected unchanged=1, got ' .. report.unchanged)
+    assert(report.modified == 0, 'expected modified=0, got ' .. report.modified)
+end)
+
+test('multiple vim.NIL fields across all versions = noop', function()
+    local base = {
+        { id = 'x', text = 'test', done = false, created_at = 100,
+          notes = vim.NIL, category = vim.NIL },
+    }
+    local local_ = {
+        { id = 'x', text = 'test', done = false, created_at = 100 },
+    }
+    local remote = {
+        { id = 'x', text = 'test', done = false, created_at = 100,
+          category = vim.NIL },
+    }
+    local merged, report = merge.merge(base, local_, remote)
+    assert(report.is_noop == true, 'expected noop')
+    assert(report.unchanged == 1)
+end)
+
+test('stable_encode produces deterministic output regardless of table creation order', function()
+    local t1 = { id = 'x', text = 'hello', done = false, created_at = 100 }
+    local t2 = { created_at = 100, done = false, id = 'x', text = 'hello' }
+    assert(merge.stable_encode(t1) == merge.stable_encode(t2),
+        'same data in different insertion order must serialize identically')
+end)
+
+test('stable_encode strips vim.NIL from output', function()
+    local t1 = { id = 'x', text = 'hello', notes = vim.NIL }
+    local t2 = { id = 'x', text = 'hello' }
+    assert(merge.stable_encode(t1) == merge.stable_encode(t2),
+        'vim.NIL field must not appear in serialized output')
+end)
+
+test('stable_encode handles nested tables and arrays', function()
+    local t = { id = 'x', priorities = { 1, 2, 3 }, meta = { a = 'b', c = 'd' } }
+    local encoded = merge.stable_encode(t)
+    -- Should be deterministic on repeated calls.
+    assert(encoded == merge.stable_encode(t), 'repeated calls must be identical')
+    -- Nested object keys should be sorted.
+    assert(encoded:find('"a":"b"'), 'nested object keys should be sorted')
+end)
+
+-------------------------------------------------------------------------------
 puts('')
 -------------------------------------------------------------------------------
 

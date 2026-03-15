@@ -15,11 +15,20 @@ local FIELDS = {
 -- Helpers
 -------------------------------------------------------------------------------
 
---- Deep-compare two values (handles nil, primitives, and tables).
+--- Treat vim.NIL as nil (JSON null → Lua nil normalization).
+--- @param v any
+--- @return any
+local function denull(v)
+    if v == vim.NIL then return nil end
+    return v
+end
+
+--- Deep-compare two values (handles nil, vim.NIL, primitives, and tables).
 --- @param a any
 --- @param b any
 --- @return boolean
 local function equal(a, b)
+    a, b = denull(a), denull(b)
     if a == nil and b == nil then return true end
     if a == nil or b == nil then return false end
     if type(a) ~= type(b) then return false end
@@ -27,15 +36,93 @@ local function equal(a, b)
     return vim.deep_equal(a, b)
 end
 
+--- Recursively strip vim.NIL values from a table so that JSON round-trips
+--- are deterministic (absent key and JSON null both become absent).
+--- @param tbl table
+--- @return table
+local function strip_nil_values(tbl)
+    local out = {}
+    for k, v in pairs(tbl) do
+        if v == vim.NIL then
+            -- drop it
+        elseif type(v) == 'table' then
+            out[k] = strip_nil_values(v)
+        else
+            out[k] = v
+        end
+    end
+    return out
+end
+
+--- Deterministic JSON-like serialization of a value.
+--- vim.json.encode does NOT sort keys, so we must do it ourselves to get
+--- stable output for comparison purposes.
+--- @param val any
+--- @return string
+local function stable_encode(val)
+    if val == nil or val == vim.NIL then return 'null' end
+    local t = type(val)
+    if t == 'string' then
+        -- Use vim.json.encode for proper escaping of strings.
+        return vim.json.encode(val)
+    elseif t == 'number' then
+        -- Integer vs float distinction.
+        if val == math.floor(val) and val >= -2^53 and val <= 2^53 then
+            return string.format('%d', val)
+        else
+            return string.format('%.17g', val)
+        end
+    elseif t == 'boolean' then
+        return val and 'true' or 'false'
+    elseif t == 'table' then
+        -- Array check: non-empty with consecutive integer keys starting at 1.
+        local n = #val
+        local is_array = n > 0
+        if is_array then
+            for i = 1, n do
+                if val[i] == nil then is_array = false; break end
+            end
+        end
+        if is_array then
+            local parts = {}
+            for i = 1, n do
+                parts[i] = stable_encode(val[i])
+            end
+            return '[' .. table.concat(parts, ',') .. ']'
+        else
+            -- Object: collect keys, sort, serialize.
+            local keys = {}
+            for k, _ in pairs(val) do
+                if type(k) == 'string' then
+                    keys[#keys + 1] = k
+                end
+            end
+            table.sort(keys)
+            local parts = {}
+            for _, k in ipairs(keys) do
+                local v = val[k]
+                if v ~= nil and v ~= vim.NIL then
+                    parts[#parts + 1] = stable_encode(k) .. ':' .. stable_encode(v)
+                end
+            end
+            return '{' .. table.concat(parts, ',') .. '}'
+        end
+    else
+        return tostring(val)
+    end
+end
+
 --- Serialize a todo item deterministically for whole-item comparison.
+--- Uses sorted-key encoding and strips vim.NIL values.
 --- @param item table|nil
 --- @return string|nil
 local function serialize(item)
     if item == nil then return nil end
-    return vim.json.encode(item, { sort_keys = true })
+    return stable_encode(item)
 end
 
 --- Build an id-keyed map from a list of todos.
+--- Items are normalized (vim.NIL → absent) for consistent comparison.
 --- @param todos table|nil  Array of todo items.
 --- @return table<string, table>  Map from id → todo item.
 local function id_map(todos)
@@ -43,7 +130,7 @@ local function id_map(todos)
     if not todos then return map end
     for _, item in ipairs(todos) do
         if item.id then
-            map[item.id] = item
+            map[item.id] = strip_nil_values(item)
         end
     end
     return map
@@ -281,5 +368,11 @@ function M.merge(base, local_, remote)
 
     return merged, report
 end
+
+--- Expose stable_encode for use by other modules (e.g. push comparison).
+M.stable_encode = stable_encode
+
+--- Expose strip_nil_values for normalizing tables before comparison.
+M.strip_nil_values = strip_nil_values
 
 return M

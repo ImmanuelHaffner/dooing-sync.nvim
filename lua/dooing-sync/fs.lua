@@ -44,7 +44,7 @@ end
 --- @param data table
 --- @return boolean ok
 function M.write_json(path, data)
-    local json_str = vim.json.encode(data, { sort_keys = true })
+    local json_str = vim.json.encode(data)
     local tmp_path = path .. '.dooing-sync.tmp'
     local file = io.open(tmp_path, 'w')
     if not file then

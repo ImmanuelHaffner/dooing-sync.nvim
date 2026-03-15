@@ -76,7 +76,7 @@ function M.sync(opts)
         if not remote_data then
             -- No remote file yet. Push local as-is.
             config.log('No remote file, pushing local data...', vim.log.levels.DEBUG)
-            local content = vim.json.encode(local_data, { sort_keys = true })
+            local content = vim.json.encode(local_data)
             gdrive.push(content, function(ok, push_err)
                 if ok then
                     fs.save_base(local_data)
@@ -108,8 +108,12 @@ function M.sync(opts)
         fs.save_base(merged)
 
         -- Push to Drive if merged differs from remote.
-        local merged_json = vim.json.encode(merged, { sort_keys = true })
-        if merged_json ~= remote_content then
+        -- Use the merge module's deterministic serializer so key ordering
+        -- and vim.NIL differences don't cause false positives.
+        local merged_json = vim.json.encode(merged)
+        local merged_stable = merge.stable_encode(merged)
+        local remote_stable = merge.stable_encode(remote_data)
+        if merged_stable ~= remote_stable then
             gdrive.push(merged_json, function(ok, push_err)
                 if ok then
                     last_sync_time = os.time()
@@ -142,7 +146,7 @@ local function push_local(on_done)
         return
     end
 
-    local content = vim.json.encode(local_data, { sort_keys = true })
+    local content = vim.json.encode(local_data)
 
     gdrive.push(content, function(ok, err)
         if ok then
