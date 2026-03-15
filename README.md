@@ -30,7 +30,7 @@ set up **before** dooing so the initial sync runs first.
     'atiladefreitas/dooing',
     version = '^2',
     dependencies = {
-        'your-username/dooing-sync.nvim',
+        'ImmanuelHaffner/dooing-sync.nvim',
     },
     config = function()
         -- Sync setup FIRST: pulls from Google Drive, merges, writes to save_path.
