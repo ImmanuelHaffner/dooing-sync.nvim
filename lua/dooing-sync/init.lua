@@ -30,7 +30,7 @@ local function log_report(report)
     if report.conflicts > 0    then table.insert(parts, '!' .. report.conflicts .. ' conflicts') end
 
     if #parts == 0 then
-        config.log('Sync: no changes', vim.log.levels.DEBUG)
+        config.log('Sync: no changes', vim.log.levels.INFO, { routine = true })
     else
         config.log('Sync: ' .. table.concat(parts, ', '), vim.log.levels.INFO)
     end
@@ -81,7 +81,7 @@ function M.sync(opts)
                 if ok then
                     fs.save_base(local_data)
                     last_sync_time = os.time()
-                    config.log('Initial push complete', vim.log.levels.INFO)
+                    config.log('Initial push complete', vim.log.levels.INFO, { routine = true })
                 else
                     config.log('Initial push failed: ' .. (push_err or '?'), vim.log.levels.WARN)
                 end

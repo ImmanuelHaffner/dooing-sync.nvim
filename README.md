@@ -155,6 +155,13 @@ require('dooing-sync').setup({
     -- 'remote': always prefer remote version
     conflict_strategy = 'recent',
 
+    -- Notification verbosity.
+    -- 'all':     show every sync message (default)
+    -- 'changes': only notify when data actually changed (or on warnings/errors)
+    -- 'errors':  only show warnings and errors
+    -- 'none':    suppress all notifications
+    notify = 'all',
+
     -- Enable debug logging.
     debug = false,
 })

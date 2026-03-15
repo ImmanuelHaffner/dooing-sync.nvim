@@ -36,6 +36,13 @@ M.defaults = {
     --- Options: 'prompt', 'local', 'remote', 'recent'
     conflict_strategy = 'recent',
 
+    --- Notification verbosity.
+    --- 'all'     — show every sync message (default)
+    --- 'changes' — only notify when data actually changed (or on warnings/errors)
+    --- 'errors'  — only show warnings and errors
+    --- 'none'    — suppress all notifications (not recommended)
+    notify = 'all',
+
     --- Enable debug logging.
     debug = false,
 }
@@ -73,11 +80,20 @@ end
 --- Log a message at the appropriate level.
 --- @param msg string
 --- @param level integer  vim.log.levels.*
-function M.log(msg, level)
+--- @param opts { routine: boolean }|nil  If routine=true, the message is
+---   suppressed in 'changes' mode (use for status messages that don't
+---   indicate actual data changes).
+function M.log(msg, level, opts)
     level = level or vim.log.levels.INFO
     if level == vim.log.levels.DEBUG and not M.options.debug then
         return
     end
+
+    local notify = M.options.notify or 'all'
+    if notify == 'none' then return end
+    if notify == 'errors' and level < vim.log.levels.WARN then return end
+    if notify == 'changes' and (opts and opts.routine) then return end
+
     vim.notify('[dooing-sync] ' .. msg, level)
 end
 
