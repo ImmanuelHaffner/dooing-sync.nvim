@@ -43,6 +43,13 @@ M.defaults = {
     --- 'none'    — suppress all notifications (not recommended)
     notify = 'all',
 
+    --- Maximum time (ms) to wait for the sync lock.
+    --- Set to 0 to disable locking (not recommended with multiple sessions).
+    lock_timeout_ms = 10000,
+
+    --- Maximum number of retries on ETag mismatch (HTTP 412).
+    max_retries = 2,
+
     --- Enable debug logging.
     debug = false,
 }

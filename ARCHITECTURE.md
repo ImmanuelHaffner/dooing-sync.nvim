@@ -14,6 +14,7 @@ dooing todo lists across machines via Google Drive.
 - [File Watching & Push-on-Save](#file-watching--push-on-save)
 - [Token Management](#token-management)
 - [Error Handling & Offline Mode](#error-handling--offline-mode)
+- [Concurrency Protection](#concurrency-protection)
 - [Testing Strategy](#testing-strategy)
 
 ---
@@ -115,8 +116,8 @@ performs a one-time browser-based authorization to obtain a long-lived refresh t
 
 ```
 ┌───────────┐                       ┌──────────────┐
-│  Neovim   │                       │ Google OAuth  │
-│  (curl)   │                       │    Server     │
+│  Neovim   │                       │ Google OAuth │
+│  (curl)   │                       │    Server    │
 └─────┬─────┘                       └──────┬───────┘
       │                                    │
       │  POST /token                       │
@@ -158,6 +159,81 @@ file ID is cached in memory after the first lookup to avoid repeated searches.
 
 ---
 
+## Concurrency Protection
+
+dooing-sync is safe to use with **multiple Neovim sessions on the same machine** and
+**multiple machines syncing to the same Google Drive file**.
+
+### Threat Model
+
+| # | Race | Without protection |
+|---|------|--------------------|
+| R1 | Two sessions read/write `base_path` concurrently | Stale base → incorrect merge → data loss |
+| R2 | Two sessions write `save_path` concurrently | Last writer clobbers the other's merge |
+| R3 | Two sessions (or machines) push to Drive concurrently | Last push wins, silently dropping changes |
+| R4 | Session reads `save_path` while another writes | Stale read → stale merge |
+
+### Two-Layer Protection
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                        Same Machine                              │
+│                                                                  │
+│   Session A ──┐                                                  │
+│               ├── Local Lockfile ── serializes access to ──┐     │
+│   Session B ──┘   (fs.lua)         save_path & base_path   │     │
+│                                                            │     │
+│                                                            ▼     │
+│                                                     ┌──────────┐ │
+│   Machine X ──┐                                     │  Google  │ │
+│               ├── ETag Conditional Push ───────────►│  Drive   │ │
+│   Machine Y ──┘   (gdrive.lua)                      └──────────┘ │
+│                    prevents lost updates                         │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+#### Layer 1: Local File Locking
+
+A lockfile at `<base_path>.lock` serializes the entire sync cycle across Neovim sessions
+on the same machine. The lock covers all local reads, the merge, local writes, and the
+push to Drive.
+
+- **Mechanism**: `O_CREAT|O_EXCL` via `vim.uv.fs_open()` for atomic creation.
+- **Content**: The PID of the owning process.
+- **Stale detection**: On lock failure, the lockfile's PID is read and checked with
+  `kill(pid, 0)`. If the process is dead, the lock is removed and reacquired.
+- **Timeout**: Configurable via `lock_timeout_ms` (default: 10s). On timeout, the sync
+  is skipped — the next trigger will retry.
+- **Reentrancy guard**: A module-local `sync_in_progress` flag in `init.lua` prevents
+  reentrant sync attempts (e.g. file watcher firing during an ongoing sync).
+
+#### Layer 2: ETag-Based Conditional Push
+
+Google Drive assigns an **ETag** to every file version. dooing-sync captures the ETag
+on download and sends it back as an `If-Match` header on upload.
+
+- **Download**: `curl -D <tmpfile>` captures response headers; the `ETag` header is parsed.
+- **Upload**: When an ETag is available, `curl -H "If-Match: <etag>"` makes the push
+  conditional. If another machine pushed since our download, Drive returns **HTTP 412
+  Precondition Failed**.
+- **Retry**: On 412, the entire sync cycle is retried (release lock → re-pull → re-merge
+  → re-push with fresh ETag). Retries are capped at `max_retries` (default: 2).
+- **Graceful fallback**: If the ETag is unavailable (e.g. header stripped by proxy), the
+  push is unconditional (equivalent to pre-concurrency behavior).
+
+### Base Snapshot Integrity
+
+The base snapshot is only updated **after a successful push** (or when no push is needed
+because merged == remote). This ensures that a failed push leaves the base in its previous
+state, so the next sync re-merges correctly without data loss.
+
+### No Blind Pushes
+
+There is no "push-only" code path. Every push goes through the full three-way merge cycle
+(`pull → merge → push`), ensuring we never overwrite remote changes.
+
+---
+
 ## Synchronization Flow
 
 ### Startup Sync (Blocking)
@@ -175,26 +251,27 @@ the already-merged data.
  │
  ├─ INITIAL SYNC (blocking via vim.wait)
  │  │
- │  ├─ 1. Refresh access token
+ │  ├─ 1. Acquire local lock
  │  │
- │  ├─ 2. Pull remote
+ │  ├─ 2. Load base snapshot + local file (under lock)
+ │  │
+ │  ├─ 3. Pull remote (with ETag capture)
  │  │     ├─ Find file on Drive (by name + folder)
- │  │     └─ Download content
- │  │        └─ Not found? → push local as-is, done
+ │  │     └─ Download content + ETag
+ │  │        └─ Not found? → push local as-is, save base, unlock, done
  │  │
- │  ├─ 3. Load local (save_path)
- │  │
- │  ├─ 4. Load base snapshot
- │  │
- │  ├─ 5. Three-way merge(base, local, remote)
+ │  ├─ 4. Three-way merge(base, local, remote)
  │  │     └─ See "Three-Way Merge Algorithm" below
  │  │
- │  ├─ 6. Write merged → save_path (if changed)
+ │  ├─ 5. Write merged → save_path (if changed)
  │  │     └─ Set write guard (suppress file watcher)
  │  │
- │  ├─ 7. Write merged → base snapshot
+ │  ├─ 6. Push merged → Drive (conditional: If-Match ETag)
+ │  │     ├─ Success → save base snapshot, unlock, done
+ │  │     ├─ 412 Mismatch → unlock, retry from step 1 (max 2 retries)
+ │  │     └─ Other error → unlock, done (retry on next trigger)
  │  │
- │  └─ 8. Push merged → Drive (async, only if merged ≠ remote)
+ │  └─ 7. Release local lock
  │
  ├─ Start file watcher on save_path
  │
@@ -210,7 +287,8 @@ the already-merged data.
 
 ### Push-on-Save Flow
 
-Triggered by the file watcher when dooing writes to `save_path`.
+Triggered by the file watcher when dooing writes to `save_path`. Uses the full sync
+cycle (not a blind push) to prevent lost updates.
 
 ```
  dooing saves file
@@ -220,48 +298,33 @@ Triggered by the file watcher when dooing writes to `save_path`.
  │
  ├─ Debounce (500ms)
  │
- ├─ Write guard active?
- │  └─ Yes → skip (this was our own write)
+ ├─ Write guard active? → Yes → skip (this was our own write)
  │
- ├─ Read new local content
+ ├─ Sync already in progress? → Yes → skip
  │
- ├─ Upload to Google Drive (async)
- │
- └─ Update base snapshot
+ └─ Full sync cycle (same as startup sync: lock → pull → merge → push → unlock)
 ```
 
 ### Periodic Pull Flow
 
-Triggered by a repeating timer (default: every 5 minutes).
+Triggered by a repeating timer (default: every 5 minutes). Uses the same full sync cycle.
 
 ```
  Timer fires
  │
- ├─ Pull remote from Drive
+ ├─ Sync already in progress? → Yes → skip
  │
- ├─ Compare remote with base snapshot
- │  └─ Identical? → skip (no remote changes)
- │
- ├─ Three-way merge(base, local, remote)
- │
- ├─ Write merged → save_path (if changed)
- │  └─ Reload dooing's in-memory state
- │
- ├─ Write merged → base snapshot
- │
- └─ Push merged → Drive (if merged ≠ remote)
+ └─ Full sync cycle (lock → pull → merge → push → unlock)
 ```
 
 ### VimLeavePre Flow
 
-Ensures data is pushed before Neovim exits.
+Ensures data is synced before Neovim exits. Uses a blocking full sync cycle.
 
 ```
  VimLeavePre
  │
- ├─ Read local save_path
- ├─ Upload to Drive (async, but vim.wait blocks up to 10s)
- └─ Update base snapshot
+ └─ Full sync cycle (blocking, up to 15s timeout)
 ```
 
 ---
@@ -435,7 +498,9 @@ with any secret management approach:
 | Corrupt remote JSON | Logged as error, merge skipped, local preserved |
 | Corrupt base snapshot | Treated as first sync (base = nil) |
 | Initial sync timeout | Logged as warning, dooing loads local data |
-| Concurrent pushes from two machines | Last push wins; next pull on other machine reconciles via merge |
+| Concurrent pushes from two machines | ETag mismatch → automatic retry with fresh data (up to `max_retries`) |
+| Lock timeout (another local session syncing) | Sync skipped; next trigger retries |
+| Neovim crash while holding lock | Stale lock detected by PID check on next sync, automatically removed |
 
 ### Logging Levels
 
@@ -454,13 +519,16 @@ with any secret management approach:
 
 ```
 tests/
-├── test_config.lua   13 unit tests      Config merging, credential validation, path resolution
-├── test_fs.lua       13 unit tests      JSON I/O, atomic writes, base snapshots, file watcher
-├── test_merge.lua    18 unit tests      All merge cases, field-level merge, conflict strategies
-├── test_gdrive.lua    5 integration     Token refresh, push/pull round-trip (requires credentials)
-└── test_init.lua     10 integration     Full lifecycle: setup, sync, push-on-save, teardown
-                      ──────────────
-                      59 total
+├── test_config.lua       13 unit tests   Config merging, credential validation, path resolution
+├── test_fs.lua           13 unit tests   JSON I/O, atomic writes, base snapshots, file watcher
+├── test_fs_lock.lua      18 unit tests   File locking, PID detection, stale lock cleanup
+├── test_merge.lua        18 unit tests   All merge cases, field-level merge, conflict strategies
+├── test_gdrive_etag.lua  16 unit tests   ETag parsing, If-Match headers, 412 detection
+├── test_init_sync.lua     9 unit tests   Protected sync cycle, retry, lock lifecycle (mocked gdrive)
+├── test_gdrive.lua        5 integration  Token refresh, push/pull round-trip (requires credentials)
+└── test_init.lua         10 integration  Full lifecycle: setup, sync, push-on-save, teardown
+                          ──────────────
+                          102 total
 ```
 
 ### Running Tests
@@ -469,7 +537,10 @@ tests/
 # Unit tests (offline, fast)
 nvim --headless -l tests/test_config.lua
 nvim --headless -l tests/test_fs.lua
+nvim --headless -l tests/test_fs_lock.lua
 nvim --headless -l tests/test_merge.lua
+nvim --headless -l tests/test_gdrive_etag.lua
+nvim --headless -l tests/test_init_sync.lua
 
 # Integration tests (requires network + OAuth credentials)
 nvim --headless -l tests/test_gdrive.lua

@@ -42,10 +42,34 @@ local function parse_response(stdout, stderr, code)
         return nil, 'invalid JSON response: ' .. stdout:sub(1, 200)
     end
     if data.error then
+        -- Distinguish 412 Precondition Failed (ETag mismatch) from other errors.
+        if data.error.code == 412 then
+            return nil, 'etag_mismatch'
+        end
         local msg = data.error.message or data.error_description or vim.inspect(data.error)
         return nil, 'API error: ' .. msg
     end
     return data, nil
+end
+
+--- Parse the ETag header value from a headers file written by curl -D.
+--- @param header_path string  Path to the headers dump file.
+--- @return string|nil etag    The ETag value (including quotes), or nil.
+local function parse_etag_from_headers(header_path)
+    local f = io.open(header_path, 'r')
+    if not f then return nil end
+    local content = f:read('*a')
+    f:close()
+    os.remove(header_path)
+    if not content then return nil end
+    -- Case-insensitive match for "ETag: <value>" header.
+    -- Capture the quoted value (Google Drive always quotes ETags).
+    local etag = content:match('[Ee][Tt][Aa][Gg]:%s*(".-")')
+    if not etag then
+        -- Fallback: unquoted ETag value.
+        etag = content:match('[Ee][Tt][Aa][Gg]:%s*(%S+)')
+    end
+    return etag
 end
 
 -------------------------------------------------------------------------------
@@ -147,55 +171,76 @@ end
 --- Download a file's content from Google Drive.
 --- @param token string     Access token.
 --- @param file_id string   Drive file ID.
---- @param callback fun(content: string|nil, err: string|nil)
+--- @param callback fun(content: string|nil, etag: string|nil, err: string|nil)
 function M.download(token, file_id, callback)
+    local header_path = vim.fn.tempname()
     local cmd = curl_cmd({
+        '-D', header_path,
         '-H', 'Authorization: Bearer ' .. token,
         'https://www.googleapis.com/drive/v3/files/' .. file_id .. '?alt=media',
     })
 
     vim.system(cmd, { text = true }, function(result)
         vim.schedule(function()
+            -- Parse ETag from response headers (also cleans up the header file).
+            local etag = parse_etag_from_headers(header_path)
+
             if result.code ~= 0 then
-                callback(nil, 'curl failed (exit ' .. result.code .. ')')
+                callback(nil, nil, 'curl failed (exit ' .. result.code .. ')')
                 return
             end
             if not result.stdout or result.stdout == '' then
-                callback(nil, 'empty response')
+                callback(nil, nil, 'empty response')
                 return
             end
-            -- Verify it's valid JSON before returning.
-            local ok, _ = pcall(vim.json.decode, result.stdout)
-            if not ok then
-                -- Could be an error response.
-                local edata, _ = pcall(vim.json.decode, result.stdout)
-                if type(edata) == 'table' and edata.error then
-                    callback(nil, 'API error: ' .. (edata.error.message or 'unknown'))
-                else
-                    callback(nil, 'downloaded content is not valid JSON')
-                end
+            -- Verify it's valid JSON and not an API error response.
+            local decode_ok, decoded = pcall(vim.json.decode, result.stdout)
+            if not decode_ok then
+                callback(nil, nil, 'downloaded content is not valid JSON')
                 return
             end
-            config.log('Downloaded ' .. #result.stdout .. ' bytes', vim.log.levels.DEBUG)
-            callback(result.stdout, nil)
+            if type(decoded) == 'table' and decoded.error then
+                local msg = decoded.error.message or vim.inspect(decoded.error)
+                callback(nil, nil, 'API error: ' .. msg)
+                return
+            end
+            config.log('Downloaded ' .. #result.stdout .. ' bytes (etag: ' .. (etag or 'nil') .. ')', vim.log.levels.DEBUG)
+            callback(result.stdout, etag, nil)
         end)
     end)
 end
 
 --- Update an existing file's content on Google Drive.
---- @param token string     Access token.
---- @param file_id string   Drive file ID.
---- @param content string   New file content (JSON string).
---- @param callback fun(ok: boolean, err: string|nil)
-function M.upload(token, file_id, content, callback)
-    local cmd = curl_cmd({
+--- Supports conditional upload via ETag (If-Match header).
+--- @param token string              Access token.
+--- @param file_id string            Drive file ID.
+--- @param content string            New file content (JSON string).
+--- @param etag_or_cb string|function|nil  ETag for conditional upload, or callback (backward compat).
+--- @param callback fun(ok: boolean, err: string|nil)|nil
+function M.upload(token, file_id, content, etag_or_cb, callback)
+    -- Backward compatible: upload(token, file_id, content, callback) still works.
+    local etag = nil
+    if type(etag_or_cb) == 'function' then
+        callback = etag_or_cb
+    else
+        etag = etag_or_cb
+    end
+
+    local args = {
         '-X', 'PATCH',
         '-H', 'Authorization: Bearer ' .. token,
         '-H', 'Content-Type: application/json',
-        '--data-raw', content,
-        'https://www.googleapis.com/upload/drive/v3/files/' .. file_id
-            .. '?uploadType=media&fields=id,modifiedTime',
-    })
+    }
+    if etag then
+        table.insert(args, '-H')
+        table.insert(args, 'If-Match: ' .. etag)
+    end
+    table.insert(args, '--data-raw')
+    table.insert(args, content)
+    table.insert(args, 'https://www.googleapis.com/upload/drive/v3/files/' .. file_id
+        .. '?uploadType=media&fields=id,modifiedTime')
+
+    local cmd = curl_cmd(args)
 
     vim.system(cmd, { text = true }, function(result)
         vim.schedule(function()
@@ -299,20 +344,20 @@ end
 
 --- Download the dooing file from Google Drive.
 --- Handles token acquisition, file lookup, and download in one call.
---- @param callback fun(content: string|nil, err: string|nil)
+--- @param callback fun(content: string|nil, etag: string|nil, err: string|nil)
 function M.pull(callback)
     M.get_access_token(function(token, err)
-        if err then callback(nil, err); return end
+        if err then callback(nil, nil, err); return end
 
         local filename = config.options.gdrive_filename
         local folder_id = config.options.gdrive_folder_id
 
         M.find_file(token, filename, folder_id, function(file_id, find_err)
-            if find_err then callback(nil, find_err); return end
+            if find_err then callback(nil, nil, find_err); return end
             if not file_id then
                 -- File doesn't exist on Drive yet; not an error.
                 config.log('No remote file found, will create on first push', vim.log.levels.DEBUG)
-                callback(nil, nil)
+                callback(nil, nil, nil)
                 return
             end
             cached_file_id = file_id
@@ -323,9 +368,23 @@ end
 
 --- Upload content to the dooing file on Google Drive.
 --- Creates the file if it doesn't exist.
---- @param content string  JSON string to upload.
---- @param callback fun(ok: boolean, err: string|nil)
-function M.push(content, callback)
+--- Supports conditional upload via ETag to prevent lost updates.
+--- @param content string                  JSON string to upload.
+--- @param etag_or_cb string|function|nil  ETag for conditional upload, or callback (backward compat).
+--- @param callback fun(ok: boolean, err: string|nil)|nil
+function M.push(content, etag_or_cb, callback)
+    -- Backward compatible: push(content, callback) still works.
+    local etag = nil
+    if type(etag_or_cb) == 'function' then
+        callback = etag_or_cb
+    else
+        etag = etag_or_cb
+    end
+
+    if etag then
+        config.log('Pushing with ETag: ' .. etag, vim.log.levels.DEBUG)
+    end
+
     M.get_access_token(function(token, err)
         if err then callback(false, err); return end
 
@@ -337,9 +396,17 @@ function M.push(content, callback)
                 callback(true, nil)
                 return
             end
-            M.upload(token, file_id, content, callback)
+            M.upload(token, file_id, content, etag, callback)
         end)
     end)
 end
+
+--- Expose internals for testing.
+--- @private
+M._testing = {
+    parse_response = parse_response,
+    parse_etag_from_headers = parse_etag_from_headers,
+    curl_cmd = curl_cmd,
+}
 
 return M

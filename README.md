@@ -9,6 +9,7 @@ Google Drive sync for [dooing](https://github.com/atiladefreitas/dooing) — syn
 - **No format changes** — works with dooing's native JSON format, fully forward-compatible with upstream updates
 - **Offline-safe** — if the network is unavailable, dooing works normally; sync resumes when connectivity returns
 - **Minimal dependencies** — only requires `curl` (universally available) and a Google Cloud project with Drive API enabled
+- **Multi-session safe** — file locking + ETag-based conditional push prevents data loss across concurrent Neovim sessions and machines
 - **Graceful degradation** — missing credentials simply disable sync; dooing continues to work as usual
 
 ## Requirements
@@ -28,7 +29,6 @@ set up **before** dooing so the initial sync runs first.
 ```lua
 {
     'atiladefreitas/dooing',
-    version = '^2',
     dependencies = {
         'ImmanuelHaffner/dooing-sync.nvim',
     },
@@ -162,6 +162,10 @@ require('dooing-sync').setup({
     -- 'none':    suppress all notifications
     notify = 'all',
 
+    -- Concurrency protection.
+    lock_timeout_ms = 10000,  -- max time to wait for sync lock (0 = disable locking)
+    max_retries = 2,          -- retry count on ETag mismatch (HTTP 412)
+
     -- Enable debug logging.
     debug = false,
 })
@@ -191,6 +195,19 @@ dooing_sync.sync()
 -- Teardown (stop watcher, timers, remove commands)
 dooing_sync.teardown()
 ```
+
+## Multi-Session Safety
+
+dooing-sync is safe to use with multiple Neovim instances on the same machine and across
+multiple machines:
+
+- **Same machine**: A lockfile serializes sync cycles across sessions. If one session is
+  syncing, others wait (up to `lock_timeout_ms`) or skip. Stale locks from crashed
+  sessions are automatically detected and removed.
+- **Multiple machines**: ETag-based conditional push prevents lost updates. If another
+  machine pushed since we last pulled, the push fails and the sync retries with fresh data.
+- **Every push is a full sync**: There are no blind pushes. Every write to Google Drive
+  goes through the three-way merge, ensuring remote changes are never silently overwritten.
 
 ## How It Works
 
@@ -230,6 +247,12 @@ Fields are merged individually. If different fields were changed (e.g. text on o
 done status on another), both changes are kept. If the same field was changed to different
 values, the `conflict_strategy` setting determines the winner (default: most recent).
 
+### Can I run multiple Neovim sessions on the same machine?
+
+Yes. A lockfile serializes sync operations so sessions don't corrupt each other's data.
+If a session crashes mid-sync, the stale lock is automatically detected and cleaned up by
+the next session.
+
 ## Running Tests
 
 ```bash
@@ -238,7 +261,10 @@ cd ~/.local/share/nvim/lazy/dooing-sync.nvim
 # Unit tests (no network required)
 nvim --headless -l tests/test_config.lua
 nvim --headless -l tests/test_fs.lua
+nvim --headless -l tests/test_fs_lock.lua
 nvim --headless -l tests/test_merge.lua
+nvim --headless -l tests/test_gdrive_etag.lua
+nvim --headless -l tests/test_init_sync.lua
 
 # Integration tests (requires OAuth credentials in environment)
 nvim --headless -l tests/test_gdrive.lua

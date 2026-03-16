@@ -146,7 +146,7 @@ test('file write triggers push to Drive', function()
     -- Verify remote has the new item.
     local pull_done = false
     local remote_items
-    require('dooing-sync.gdrive').pull(function(content, err)
+    require('dooing-sync.gdrive').pull(function(content, _etag, err)
         if content then
             remote_items = vim.json.decode(content)
         end

@@ -121,10 +121,10 @@ puts('gdrive file operations')
 -------------------------------------------------------------------------------
 
 test('pull returns content or nil (no error)', function()
-    local content, err
+    local content, etag, err
     local done = false
-    gdrive.pull(function(c, e)
-        content, err = c, e
+    gdrive.pull(function(c, et, e)
+        content, etag, err = c, et, e
         done = true
     end)
     wait(15000, function() return done end)
@@ -134,6 +134,9 @@ test('pull returns content or nil (no error)', function()
     if content then
         local ok, _ = pcall(vim.json.decode, content)
         assert(ok, 'content should be valid JSON')
+        -- ETag should be present for an existing file.
+        assert(etag ~= nil, 'etag should be non-nil when content exists')
+        assert(etag:match('^".*"$'), 'etag should be quoted: ' .. tostring(etag))
     end
 end)
 
@@ -155,10 +158,10 @@ test('push then pull round-trip', function()
     assert(push_ok, 'push failed: ' .. tostring(push_err))
 
     -- Pull back.
-    local pull_content, pull_err
+    local pull_content, pull_etag, pull_err
     done = false
-    gdrive.pull(function(c, e)
-        pull_content, pull_err = c, e
+    gdrive.pull(function(c, et, e)
+        pull_content, pull_etag, pull_err = c, et, e
         done = true
     end)
     wait(15000, function() return done end)
@@ -168,6 +171,7 @@ test('push then pull round-trip', function()
     local pulled = vim.json.decode(pull_content)
     assert(#pulled >= 1, 'expected at least 1 item')
     assert(pulled[1].text == 'Integration test item', 'content mismatch')
+    assert(pull_etag ~= nil, 'pull should return etag')
 end)
 
 -------------------------------------------------------------------------------

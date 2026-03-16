@@ -8,12 +8,13 @@ local gdrive = require('dooing-sync.gdrive')
 local merge  = require('dooing-sync.merge')
 
 --- State
-local save_path = nil       -- Resolved path to dooing's JSON file.
-local sync_enabled = false  -- Whether sync is active (credentials present, setup succeeded).
-local writing_local = false -- Guard: true while we are writing to save_path (suppress watcher).
-local pull_timer = nil      -- Periodic pull timer handle.
-local last_sync_time = nil  -- Timestamp of last successful sync.
-local last_report = nil     -- Last merge report.
+local save_path = nil           -- Resolved path to dooing's JSON file.
+local sync_enabled = false      -- Whether sync is active (credentials present, setup succeeded).
+local writing_local = false     -- Guard: true while we are writing to save_path (suppress watcher).
+local sync_in_progress = false  -- Guard: true while a sync cycle is running (prevents reentrant syncs).
+local pull_timer = nil          -- Periodic pull timer handle.
+local last_sync_time = nil      -- Timestamp of last successful sync.
+local last_report = nil         -- Last merge report.
 
 -------------------------------------------------------------------------------
 -- Internal helpers
@@ -49,32 +50,66 @@ end
 -- Sync operations
 -------------------------------------------------------------------------------
 
---- Perform a full sync cycle: pull → merge → write → push.
---- @param opts { blocking: boolean, on_done: fun()|nil }|nil
+--- Perform a full sync cycle: lock → pull → merge → write → push → unlock.
+---
+--- The entire cycle is protected by a local file lock (serializes access across
+--- sessions on the same machine) and ETag-based conditional push (prevents lost
+--- updates across machines).
+---
+--- @param opts { blocking: boolean, on_done: fun()|nil, _retry_count: integer|nil }|nil
 function M.sync(opts)
     opts = opts or {}
+    local retry_count = opts._retry_count or 0
+
     if not sync_enabled then
         config.log('Sync disabled (no credentials)', vim.log.levels.DEBUG)
         if opts.on_done then opts.on_done() end
         return
     end
 
-    config.log('Starting sync...', vim.log.levels.DEBUG)
+    -- Prevent reentrant syncs (e.g. file watcher firing during an ongoing sync).
+    if sync_in_progress then
+        config.log('Sync already in progress, skipping', vim.log.levels.DEBUG)
+        if opts.on_done then opts.on_done() end
+        return
+    end
 
-    gdrive.pull(function(remote_content, pull_err)
+    -- Acquire local lock (serializes with other Neovim sessions on this machine).
+    if not fs.lock() then
+        config.log('Could not acquire sync lock, skipping', vim.log.levels.WARN)
+        if opts.on_done then opts.on_done() end
+        return
+    end
+
+    sync_in_progress = true
+
+    --- Release lock, clear in-progress flag, and call on_done.
+    --- Every exit path from this point MUST call finish().
+    local function finish()
+        sync_in_progress = false
+        fs.unlock()
+        if opts.on_done then opts.on_done() end
+    end
+
+    config.log('Starting sync'
+        .. (retry_count > 0 and (' (retry ' .. retry_count .. ')') or '')
+        .. '...', vim.log.levels.DEBUG)
+
+    -- Read local state under lock (before network I/O).
+    local base_data  = fs.load_base()
+    local local_data = fs.read_json(save_path) or {}
+
+    gdrive.pull(function(remote_content, etag, pull_err)
         if pull_err then
             config.log('Pull failed: ' .. pull_err, vim.log.levels.WARN)
-            if opts.on_done then opts.on_done() end
+            finish()
             return
         end
 
-        -- Parse all three versions.
-        local base_data   = fs.load_base()
-        local local_data  = fs.read_json(save_path) or {}
         local remote_data = remote_content and vim.json.decode(remote_content) or nil
 
         if not remote_data then
-            -- No remote file yet. Push local as-is.
+            -- No remote file yet. Push local as-is (no ETag needed).
             config.log('No remote file, pushing local data...', vim.log.levels.DEBUG)
             local content = vim.json.encode(local_data)
             gdrive.push(content, function(ok, push_err)
@@ -85,7 +120,7 @@ function M.sync(opts)
                 else
                     config.log('Initial push failed: ' .. (push_err or '?'), vim.log.levels.WARN)
                 end
-                if opts.on_done then opts.on_done() end
+                finish()
             end)
             return
         end
@@ -104,59 +139,53 @@ function M.sync(opts)
             reload_dooing()
         end
 
-        -- Always update the base snapshot.
-        fs.save_base(merged)
 
-        -- Push to Drive if merged differs from remote.
+        -- Push to Drive if merged differs from remote (conditional on ETag).
         -- Use the merge module's deterministic serializer so key ordering
         -- and vim.NIL differences don't cause false positives.
         local merged_json = vim.json.encode(merged)
         local merged_stable = merge.stable_encode(merged)
         local remote_stable = merge.stable_encode(remote_data)
         if merged_stable ~= remote_stable then
-            gdrive.push(merged_json, function(ok, push_err)
+            gdrive.push(merged_json, etag, function(ok, push_err)
                 if ok then
+                    -- Push succeeded: state is consistent, update base snapshot.
+                    fs.save_base(merged)
                     last_sync_time = os.time()
                     config.log('Push complete', vim.log.levels.DEBUG)
+                    finish()
+                elseif push_err == 'etag_mismatch'
+                    and retry_count < config.options.max_retries then
+                    -- Remote changed since we pulled. Retry with fresh data.
+                    config.log(
+                        'Remote changed during sync (ETag mismatch), retrying...',
+                        vim.log.levels.INFO)
+                    -- Release lock before retry so other sessions get a chance.
+                    sync_in_progress = false
+                    fs.unlock()
+                    M.sync({
+                        on_done = opts.on_done,
+                        _retry_count = retry_count + 1,
+                    })
                 else
-                    config.log('Push failed: ' .. (push_err or '?'), vim.log.levels.WARN)
+                    if push_err == 'etag_mismatch' then
+                        config.log('ETag mismatch after '
+                            .. config.options.max_retries
+                            .. ' retries, giving up', vim.log.levels.WARN)
+                    else
+                        config.log('Push failed: '
+                            .. (push_err or '?'), vim.log.levels.WARN)
+                    end
+                    finish()
                 end
-                if opts.on_done then opts.on_done() end
             end)
         else
+            -- Remote already up-to-date: no push needed, save base.
+            fs.save_base(merged)
             last_sync_time = os.time()
             config.log('Remote already up-to-date, skipping push', vim.log.levels.DEBUG)
-            if opts.on_done then opts.on_done() end
+            finish()
         end
-    end)
-end
-
---- Push the current local file to Drive (no merge, used after local saves).
---- @param on_done fun()|nil
-local function push_local(on_done)
-    if not sync_enabled then
-        if on_done then on_done() end
-        return
-    end
-
-    local local_data = fs.read_json(save_path)
-    if not local_data then
-        config.log('Cannot push: failed to read local file', vim.log.levels.WARN)
-        if on_done then on_done() end
-        return
-    end
-
-    local content = vim.json.encode(local_data)
-
-    gdrive.push(content, function(ok, err)
-        if ok then
-            fs.save_base(local_data)
-            last_sync_time = os.time()
-            config.log('Pushed local changes', vim.log.levels.DEBUG)
-        else
-            config.log('Push failed: ' .. (err or '?'), vim.log.levels.WARN)
-        end
-        if on_done then on_done() end
     end)
 end
 
@@ -175,8 +204,8 @@ local function on_file_changed()
         return
     end
 
-    config.log('Detected dooing save, pushing...', vim.log.levels.DEBUG)
-    push_local()
+    config.log('Detected dooing save, syncing...', vim.log.levels.DEBUG)
+    M.sync()
 end
 
 -------------------------------------------------------------------------------
@@ -220,15 +249,15 @@ local augroup = nil
 local function register_autocmds()
     augroup = vim.api.nvim_create_augroup('dooing_sync', { clear = true })
 
-    -- Final push on exit (synchronous to ensure it completes).
+    -- Final sync on exit (synchronous to ensure it completes).
     vim.api.nvim_create_autocmd('VimLeavePre', {
         group = augroup,
         callback = function()
             if not sync_enabled then return end
-            config.log('Final push before exit...', vim.log.levels.DEBUG)
+            config.log('Final sync before exit...', vim.log.levels.DEBUG)
             local done = false
-            push_local(function() done = true end)
-            vim.wait(10000, function() return done end, 50)
+            M.sync({ on_done = function() done = true end })
+            vim.wait(15000, function() return done end, 50)
         end,
     })
 end
@@ -325,6 +354,7 @@ function M.teardown()
     pcall(vim.api.nvim_del_user_command, 'DooingSync')
     pcall(vim.api.nvim_del_user_command, 'DooingSyncStatus')
     sync_enabled = false
+    sync_in_progress = false
     last_sync_time = nil
     last_report = nil
     save_path = nil
