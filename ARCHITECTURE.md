@@ -186,7 +186,7 @@ dooing-sync is safe to use with **multiple Neovim sessions on the same machine**
 │                                                            ▼     │
 │                                                     ┌──────────┐ │
 │   Machine X ──┐                                     │  Google  │ │
-│               ├── ETag Conditional Push ───────────►│  Drive   │ │
+│               ├── Version Conditional Push ────────►│  Drive   │ │
 │   Machine Y ──┘   (gdrive.lua)                      └──────────┘ │
 │                    prevents lost updates                         │
 └──────────────────────────────────────────────────────────────────┘
@@ -213,18 +213,19 @@ push to Drive.
   before the async lock callback) prevents reentrant sync attempts (e.g. file watcher
   firing during an ongoing sync).
 
-#### Layer 2: ETag-Based Conditional Push
+#### Layer 2: Version-Based Conditional Push
 
-Google Drive assigns an **ETag** to every file version. dooing-sync captures the ETag
-on download and sends it back as an `If-Match` header on upload.
+Google Drive assigns a monotonically increasing **version** number to every file.
+dooing-sync captures the version on download and verifies it before uploading.
 
-- **Download**: `curl -D <tmpfile>` captures response headers; the `ETag` header is parsed.
-- **Upload**: When an ETag is available, `curl -H "If-Match: <etag>"` makes the push
-  conditional. If another machine pushed since our download, Drive returns **HTTP 412
-  Precondition Failed**.
-- **Retry**: On 412, the entire sync cycle is retried (release lock → re-pull → re-merge
-  → re-push with fresh ETag). Retries are capped at `max_retries` (default: 2).
-- **Graceful fallback**: If the ETag is unavailable (e.g. header stripped by proxy), the
+- **Download**: Content and version are fetched in parallel (two API calls: `alt=media`
+  for content, `?fields=version` for metadata).
+- **Upload**: When a version is available, a pre-flight check fetches the current version
+  from Drive. If it differs from the expected version, the upload is aborted with a
+  `version_mismatch` error (another machine pushed since we last pulled).
+- **Retry**: On mismatch, the entire sync cycle is retried (release lock → re-pull →
+  re-merge → re-push with fresh version). Retries are capped at `max_retries` (default: 2).
+- **Graceful fallback**: If the version is unavailable (e.g. metadata request failed), the
   push is unconditional (equivalent to pre-concurrency behavior).
 
 ### Base Snapshot Integrity
@@ -262,9 +263,9 @@ blocked, so Neovim remains responsive during the initial sync.
  │  │
  │  ├─ 2. Load base snapshot + local file (under lock)
  │  │
- │  ├─ 3. Pull remote (with ETag capture)
+ │  ├─ 3. Pull remote (with version capture)
  │  │     ├─ Find file on Drive (by name + folder)
- │  │     └─ Download content + ETag
+ │  │     └─ Download content + version (parallel requests)
  │  │        └─ Not found? → push local as-is, save base, unlock, done
  │  │
  │  ├─ 4. Three-way merge(base, local, remote)
@@ -273,7 +274,7 @@ blocked, so Neovim remains responsive during the initial sync.
  │  ├─ 5. Write merged → save_path (if changed)
  │  │     └─ Set write guard (suppress file watcher)
  │  │
- │  ├─ 6. Push merged → Drive (conditional: If-Match ETag)
+ │  ├─ 6. Push merged → Drive (conditional: version check)
  │  │     ├─ Success → save base snapshot, unlock, done
  │  │     ├─ 412 Mismatch → unlock, retry from step 1 (max 2 retries)
  │  │     └─ Other error → unlock, done (retry on next trigger)
@@ -506,7 +507,7 @@ with any secret management approach:
 | Corrupt remote JSON | Logged as error, merge skipped, local preserved |
 | Corrupt base snapshot | Treated as first sync (base = nil) |
 | Initial sync timeout | Logged as warning, dooing loads local data |
-| Concurrent pushes from two machines | ETag mismatch → automatic retry with fresh data (up to `max_retries`) |
+| Concurrent pushes from two machines | Version mismatch → automatic retry with fresh data (up to `max_retries`) |
 | Lock timeout (another local session syncing) | Sync skipped; next trigger retries |
 | Neovim crash while holding lock | Stale lock detected by PID check on next sync, automatically removed |
 
@@ -531,7 +532,7 @@ tests/
 ├── test_fs.lua           13 unit tests   JSON I/O, atomic writes, base snapshots, file watcher
 ├── test_fs_lock.lua      18 unit tests   File locking, PID detection, stale lock cleanup
 ├── test_merge.lua        18 unit tests   All merge cases, field-level merge, conflict strategies
-├── test_gdrive_etag.lua  16 unit tests   ETag parsing, If-Match headers, 412 detection
+├── test_gdrive_etag.lua  14 unit tests   Version-based concurrency, pre-flight checks, mismatch detection
 ├── test_init_sync.lua     9 unit tests   Protected sync cycle, retry, lock lifecycle (mocked gdrive)
 ├── test_gdrive.lua        5 integration  Token refresh, push/pull round-trip (requires credentials)
 └── test_init.lua         10 integration  Full lifecycle: setup, sync, push-on-save, teardown

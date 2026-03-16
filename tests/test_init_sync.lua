@@ -3,7 +3,7 @@
 ---   (from the plugin root directory)
 ---
 --- These tests mock gdrive to avoid real API calls.
---- They verify locking, ETag handling, and retry behavior.
+--- They verify locking, version-based concurrency, and retry behavior.
 
 vim.opt.rtp:prepend('.')
 
@@ -75,10 +75,10 @@ local function make_mock_gdrive()
         pull_calls = 0,
         push_calls = 0,
         last_push_content = nil,
-        last_push_etag = nil,
+        last_push_version = nil,
         -- Configurable responses.
         pull_content = nil,       -- JSON string or nil
-        pull_etag = nil,          -- ETag string or nil
+        pull_version = nil,          -- ETag string or nil
         pull_err = nil,           -- error string or nil
         push_ok = true,
         push_err = nil,
@@ -87,20 +87,20 @@ local function make_mock_gdrive()
     function mock.pull(callback)
         mock.pull_calls = mock.pull_calls + 1
         vim.schedule(function()
-            callback(mock.pull_content, mock.pull_etag, mock.pull_err)
+            callback(mock.pull_content, mock.pull_version, mock.pull_err)
         end)
     end
 
-    function mock.push(content, etag_or_cb, callback)
+    function mock.push(content, version_or_cb, callback)
         mock.push_calls = mock.push_calls + 1
-        local etag = nil
-        if type(etag_or_cb) == 'function' then
-            callback = etag_or_cb
+        local version = nil
+        if type(version_or_cb) == 'function' then
+            callback = version_or_cb
         else
-            etag = etag_or_cb
+            version = version_or_cb
         end
         mock.last_push_content = content
-        mock.last_push_etag = etag
+        mock.last_push_version = version
         vim.schedule(function()
             callback(mock.push_ok, mock.push_err)
         end)
@@ -110,9 +110,9 @@ local function make_mock_gdrive()
     -- but might be referenced.
     function mock.get_access_token(cb) cb('fake', nil) end
     function mock.find_file(_, _, _, cb) cb('fid', nil) end
-    function mock.download(_, _, cb) cb(mock.pull_content, mock.pull_etag, nil) end
-    function mock.upload(_, _, content, etag, cb)
-        if type(etag) == 'function' then cb = etag; etag = nil end
+    function mock.download(_, _, cb) cb(mock.pull_content, mock.pull_version, nil) end
+    function mock.upload(_, _, content, ver, cb)
+        if type(ver) == 'function' then cb = ver; ver = nil end
         cb(mock.push_ok, mock.push_err)
     end
     function mock.ensure_file(_, _, cb) cb('fid', false, nil) end
@@ -214,7 +214,7 @@ test('lock file exists during sync, removed after', function()
             lf:close()
         end
         vim.schedule(function()
-            callback(remote_data, '"etag1"', nil)
+            callback(remote_data, '"100"', nil)
         end)
     end
 
@@ -233,10 +233,10 @@ end)
 
 -------------------------------------------------------------------------------
 puts('')
-puts('S2: Sync retries on ETag mismatch (412)')
+puts('S2: Sync retries on version mismatch')
 -------------------------------------------------------------------------------
 
-test('retries once on etag_mismatch then succeeds', function()
+test('retries once on version_mismatch then succeeds', function()
     cleanup()
     local remote_v1 = { { id = 'item_1', text = 'Test item 1', done = false, created_at = 1000 } }
     local remote_v2 = { { id = 'item_1', text = 'Test item 1', done = false, created_at = 1000 },
@@ -251,27 +251,27 @@ test('retries once on etag_mismatch then succeeds', function()
         mock.pull_calls = mock.pull_calls + 1
         vim.schedule(function()
             if mock.pull_calls <= 1 then
-                callback(vim.json.encode(remote_v1, { sort_keys = true }), '"etag_v1"', nil)
+                callback(vim.json.encode(remote_v1, { sort_keys = true }), '"200"', nil)
             else
-                callback(vim.json.encode(remote_v2, { sort_keys = true }), '"etag_v2"', nil)
+                callback(vim.json.encode(remote_v2, { sort_keys = true }), '"201"', nil)
             end
         end)
     end
 
-    -- First push fails with etag_mismatch, second succeeds.
-    mock.push = function(content, etag_or_cb, callback)
-        local etag = nil
-        if type(etag_or_cb) == 'function' then
-            callback = etag_or_cb
+    -- First push fails with version_mismatch, second succeeds.
+    mock.push = function(content, version_or_cb, callback)
+        local version = nil
+        if type(version_or_cb) == 'function' then
+            callback = version_or_cb
         else
-            etag = etag_or_cb
+            version = version_or_cb
         end
         push_attempt = push_attempt + 1
         mock.last_push_content = content
-        mock.last_push_etag = etag
+        mock.last_push_version = version
         vim.schedule(function()
             if push_attempt == 1 then
-                callback(false, 'etag_mismatch')
+                callback(false, 'version_mismatch')
             else
                 callback(true, nil)
             end
@@ -284,9 +284,9 @@ test('retries once on etag_mismatch then succeeds', function()
     assert(done, 'sync should complete')
     assert(push_attempt == 2, 'should have pushed twice, got: ' .. push_attempt)
 
-    -- Second push should use etag_v2.
-    assert(mock.last_push_etag == '"etag_v2"',
-        'retry should use fresh ETag, got: ' .. tostring(mock.last_push_etag))
+    -- Second push should use fresh version.
+    assert(mock.last_push_version == '"201"',
+        'retry should use fresh version, got: ' .. tostring(mock.last_push_version))
 
     -- Base should be saved (push succeeded).
     local base = fs.read_json(test_base_path)
@@ -308,9 +308,9 @@ test('stops retrying after max_retries', function()
 
     local dooing_sync, mock, fs = setup_with_mock({
         pull_content = remote,
-        pull_etag = '"always_stale"',
+        pull_version = '"999"',
         push_ok = false,
-        push_err = 'etag_mismatch',
+        push_err = 'version_mismatch',
     })
 
     -- All pulls return the same thing (perpetual conflict).
@@ -318,7 +318,7 @@ test('stops retrying after max_retries', function()
     mock.pull = function(callback)
         pull_count = pull_count + 1
         vim.schedule(function()
-            callback(remote, '"always_stale"', nil)
+            callback(remote, '"999"', nil)
         end)
     end
 
@@ -378,7 +378,7 @@ test('concurrent sync call is skipped', function()
 
     -- Now unblock the first sync.
     vim.schedule(function()
-        pull_callback(remote, '"etag1"', nil)
+        pull_callback(remote, '"100"', nil)
     end)
     wait(3000, function() return done1 end)
     assert(done1, 'first sync should complete')
@@ -396,7 +396,7 @@ test('on_file_changed calls sync not push_local', function()
     local remote = vim.json.encode(seed_data, { sort_keys = true })
     local dooing_sync, mock, fs = setup_with_mock({
         pull_content = remote,
-        pull_etag = '"etag1"',
+        pull_version = '"100"',
     })
 
     -- Enable push_on_save and do an initial sync to set things up.
@@ -440,7 +440,7 @@ test('base not saved when push fails', function()
 
     local dooing_sync, mock, fs = setup_with_mock({
         pull_content = remote,
-        pull_etag = '"etag1"',
+        pull_version = '"100"',
         push_ok = false,
         push_err = 'network error',
     })
@@ -471,7 +471,7 @@ test('base saved when push succeeds', function()
 
     local dooing_sync, mock, fs = setup_with_mock({
         pull_content = remote,
-        pull_etag = '"etag1"',
+        pull_version = '"100"',
         push_ok = true,
     })
 
@@ -498,7 +498,7 @@ test('base saved when remote already up-to-date (no push needed)', function()
 
     local dooing_sync, mock, fs = setup_with_mock({
         pull_content = remote,
-        pull_etag = '"etag1"',
+        pull_version = '"100"',
     })
 
     local done = false

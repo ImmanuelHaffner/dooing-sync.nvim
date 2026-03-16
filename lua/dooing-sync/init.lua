@@ -99,7 +99,7 @@ function M.sync(opts)
         local base_data  = fs.load_base()
         local local_data = fs.read_json(save_path) or {}
 
-        gdrive.pull(function(remote_content, etag, pull_err)
+        gdrive.pull(function(remote_content, version, pull_err)
         if pull_err then
             config.log('Pull failed: ' .. pull_err, vim.log.levels.WARN)
             finish()
@@ -109,7 +109,7 @@ function M.sync(opts)
         local remote_data = remote_content and vim.json.decode(remote_content) or nil
 
         if not remote_data then
-            -- No remote file yet. Push local as-is (no ETag needed).
+            -- No remote file yet. Push local as-is (no version needed).
             config.log('No remote file, pushing local data...', vim.log.levels.DEBUG)
             local content = vim.json.encode(local_data)
             gdrive.push(content, function(ok, push_err)
@@ -140,25 +140,25 @@ function M.sync(opts)
         end
 
 
-        -- Push to Drive if merged differs from remote (conditional on ETag).
+        -- Push to Drive if merged differs from remote (conditional on version).
         -- Use the merge module's deterministic serializer so key ordering
         -- and vim.NIL differences don't cause false positives.
         local merged_json = vim.json.encode(merged)
         local merged_stable = merge.stable_encode(merged)
         local remote_stable = merge.stable_encode(remote_data)
         if merged_stable ~= remote_stable then
-            gdrive.push(merged_json, etag, function(ok, push_err)
+            gdrive.push(merged_json, version, function(ok, push_err)
                 if ok then
                     -- Push succeeded: state is consistent, update base snapshot.
                     fs.save_base(merged)
                     last_sync_time = os.time()
                     config.log('Push complete', vim.log.levels.DEBUG)
                     finish()
-                elseif push_err == 'etag_mismatch'
+                elseif push_err == 'version_mismatch'
                     and retry_count < config.options.max_retries then
                     -- Remote changed since we pulled. Retry with fresh data.
                     config.log(
-                        'Remote changed during sync (ETag mismatch), retrying...',
+                        'Remote changed during sync (version mismatch), retrying...',
                         vim.log.levels.INFO)
                     -- Release lock before retry so other sessions get a chance.
                     sync_in_progress = false
@@ -169,8 +169,8 @@ function M.sync(opts)
                         _retry_count = retry_count + 1,
                     })
                 else
-                    if push_err == 'etag_mismatch' then
-                        config.log('ETag mismatch after '
+                    if push_err == 'version_mismatch' then
+                        config.log('Version mismatch after '
                             .. config.options.max_retries
                             .. ' retries, giving up', vim.log.levels.WARN)
                     else

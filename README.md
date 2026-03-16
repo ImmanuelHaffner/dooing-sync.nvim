@@ -9,7 +9,7 @@ Google Drive sync for [dooing](https://github.com/atiladefreitas/dooing) — syn
 - **No format changes** — works with dooing's native JSON format, fully forward-compatible with upstream updates
 - **Offline-safe** — if the network is unavailable, dooing works normally; sync resumes when connectivity returns
 - **Minimal dependencies** — only requires `curl` (universally available) and a Google Cloud project with Drive API enabled
-- **Multi-session safe** — file locking + ETag-based conditional push prevents data loss across concurrent Neovim sessions and machines
+- **Multi-session safe** — file locking + version-based conditional push prevents data loss across concurrent Neovim sessions and machines
 - **Graceful degradation** — missing credentials simply disable sync; dooing continues to work as usual
 
 ## Requirements
@@ -165,7 +165,7 @@ require('dooing-sync').setup({
 
     -- Concurrency protection.
     lock_timeout_ms = 10000,  -- max time to wait for sync lock (0 = disable locking)
-    max_retries = 2,          -- retry count on ETag mismatch (HTTP 412)
+    max_retries = 2,          -- retry count on version mismatch
 
     -- Enable debug logging.
     debug = false,
@@ -205,7 +205,7 @@ multiple machines:
 - **Same machine**: A lockfile serializes sync cycles across sessions. If one session is
   syncing, others wait (up to `lock_timeout_ms`) or skip. Stale locks from crashed
   sessions are automatically detected and removed.
-- **Multiple machines**: ETag-based conditional push prevents lost updates. If another
+- **Multiple machines**: Version-based conditional push prevents lost updates. If another
   machine pushed since we last pulled, the push fails and the sync retries with fresh data.
 - **Every push is a full sync**: There are no blind pushes. Every write to Google Drive
   goes through the three-way merge, ensuring remote changes are never silently overwritten.

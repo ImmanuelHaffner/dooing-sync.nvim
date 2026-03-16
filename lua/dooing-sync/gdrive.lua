@@ -52,24 +52,27 @@ local function parse_response(stdout, stderr, code)
     return data, nil
 end
 
---- Parse the ETag header value from a headers file written by curl -D.
---- @param header_path string  Path to the headers dump file.
---- @return string|nil etag    The ETag value (including quotes), or nil.
-local function parse_etag_from_headers(header_path)
-    local f = io.open(header_path, 'r')
-    if not f then return nil end
-    local content = f:read('*a')
-    f:close()
-    os.remove(header_path)
-    if not content then return nil end
-    -- Case-insensitive match for "ETag: <value>" header.
-    -- Capture the quoted value (Google Drive always quotes ETags).
-    local etag = content:match('[Ee][Tt][Aa][Gg]:%s*(".-")')
-    if not etag then
-        -- Fallback: unquoted ETag value.
-        etag = content:match('[Ee][Tt][Aa][Gg]:%s*(%S+)')
-    end
-    return etag
+--- Fetch the current version of a file from Google Drive metadata.
+--- The version is a monotonically increasing string used for optimistic concurrency.
+--- @param token string     Access token.
+--- @param file_id string   Drive file ID.
+--- @param callback fun(version: string|nil, err: string|nil)
+local function fetch_version(token, file_id, callback)
+    local cmd = curl_cmd({
+        '-H', 'Authorization: Bearer ' .. token,
+        'https://www.googleapis.com/drive/v3/files/' .. file_id .. '?fields=version',
+    })
+
+    vim.system(cmd, { text = true }, function(result)
+        vim.schedule(function()
+            local data, err = parse_response(result.stdout, result.stderr, result.code)
+            if err then
+                callback(nil, err)
+                return
+            end
+            callback(data.version, nil)
+        end)
+    end)
 end
 
 -------------------------------------------------------------------------------
@@ -169,32 +172,41 @@ function M.find_file(token, filename, folder_id, callback)
 end
 
 --- Download a file's content from Google Drive.
+--- Fetches content and file version in parallel. The version string is used
+--- for optimistic concurrency on subsequent uploads.
 --- @param token string     Access token.
 --- @param file_id string   Drive file ID.
---- @param callback fun(content: string|nil, etag: string|nil, err: string|nil)
+--- @param callback fun(content: string|nil, version: string|nil, err: string|nil)
 function M.download(token, file_id, callback)
-    local header_path = vim.fn.tempname()
-    local cmd = curl_cmd({
-        '-D', header_path,
+    local content_cmd = curl_cmd({
         '-H', 'Authorization: Bearer ' .. token,
         'https://www.googleapis.com/drive/v3/files/' .. file_id .. '?alt=media',
     })
 
-    vim.system(cmd, { text = true }, function(result)
-        vim.schedule(function()
-            -- Parse ETag from response headers (also cleans up the header file).
-            local etag = parse_etag_from_headers(header_path)
+    -- Fire content download and version fetch in parallel.
+    local content_result, version_str, version_err
+    local pending = 2
 
-            if result.code ~= 0 then
-                callback(nil, nil, 'curl failed (exit ' .. result.code .. ')')
+    local function try_finish()
+        pending = pending - 1
+        if pending > 0 then return end
+
+        -- Both requests done — process results.
+        vim.schedule(function()
+            if not content_result then
+                callback(nil, nil, 'content request missing')
                 return
             end
-            if not result.stdout or result.stdout == '' then
+            if content_result.code ~= 0 then
+                callback(nil, nil, 'curl failed (exit ' .. content_result.code .. ')')
+                return
+            end
+            if not content_result.stdout or content_result.stdout == '' then
                 callback(nil, nil, 'empty response')
                 return
             end
             -- Verify it's valid JSON and not an API error response.
-            local decode_ok, decoded = pcall(vim.json.decode, result.stdout)
+            local decode_ok, decoded = pcall(vim.json.decode, content_result.stdout)
             if not decode_ok then
                 callback(nil, nil, 'downloaded content is not valid JSON')
                 return
@@ -204,55 +216,85 @@ function M.download(token, file_id, callback)
                 callback(nil, nil, 'API error: ' .. msg)
                 return
             end
-            config.log('Downloaded ' .. #result.stdout .. ' bytes (etag: ' .. (etag or 'nil') .. ')', vim.log.levels.DEBUG)
-            callback(result.stdout, etag, nil)
+            if version_err then
+                config.log('Version fetch failed: ' .. version_err .. ' (continuing without version)', vim.log.levels.WARN)
+            end
+            config.log('Downloaded ' .. #content_result.stdout .. ' bytes (version: ' .. (version_str or 'nil') .. ')', vim.log.levels.DEBUG)
+            callback(content_result.stdout, version_str, nil)
         end)
+    end
+
+    vim.system(content_cmd, { text = true }, function(result)
+        content_result = result
+        try_finish()
+    end)
+
+    fetch_version(token, file_id, function(ver, err)
+        version_str = ver
+        version_err = err
+        try_finish()
     end)
 end
 
 --- Update an existing file's content on Google Drive.
---- Supports conditional upload via ETag (If-Match header).
+--- Supports conditional upload via version check (optimistic concurrency).
+--- If an expected_version is provided, the current version is fetched first;
+--- if it doesn't match, the upload is aborted with a 'version_mismatch' error.
 --- @param token string              Access token.
 --- @param file_id string            Drive file ID.
 --- @param content string            New file content (JSON string).
---- @param etag_or_cb string|function|nil  ETag for conditional upload, or callback (backward compat).
+--- @param version_or_cb string|function|nil  Expected version for conditional upload, or callback (backward compat).
 --- @param callback fun(ok: boolean, err: string|nil)|nil
-function M.upload(token, file_id, content, etag_or_cb, callback)
+function M.upload(token, file_id, content, version_or_cb, callback)
     -- Backward compatible: upload(token, file_id, content, callback) still works.
-    local etag = nil
-    if type(etag_or_cb) == 'function' then
-        callback = etag_or_cb
+    local expected_version = nil
+    if type(version_or_cb) == 'function' then
+        callback = version_or_cb
     else
-        etag = etag_or_cb
+        expected_version = version_or_cb
     end
 
-    local args = {
-        '-X', 'PATCH',
-        '-H', 'Authorization: Bearer ' .. token,
-        '-H', 'Content-Type: application/json',
-    }
-    if etag then
-        table.insert(args, '-H')
-        table.insert(args, 'If-Match: ' .. etag)
+    local function do_upload()
+        local cmd = curl_cmd({
+            '-X', 'PATCH',
+            '-H', 'Authorization: Bearer ' .. token,
+            '-H', 'Content-Type: application/json',
+            '--data-raw', content,
+            'https://www.googleapis.com/upload/drive/v3/files/' .. file_id
+                .. '?uploadType=media&fields=id,modifiedTime',
+        })
+
+        vim.system(cmd, { text = true }, function(result)
+            vim.schedule(function()
+                local data, err = parse_response(result.stdout, result.stderr, result.code)
+                if err then
+                    callback(false, err)
+                    return
+                end
+                config.log('Uploaded to file ' .. (data.id or file_id), vim.log.levels.DEBUG)
+                callback(true, nil)
+            end)
+        end)
     end
-    table.insert(args, '--data-raw')
-    table.insert(args, content)
-    table.insert(args, 'https://www.googleapis.com/upload/drive/v3/files/' .. file_id
-        .. '?uploadType=media&fields=id,modifiedTime')
 
-    local cmd = curl_cmd(args)
-
-    vim.system(cmd, { text = true }, function(result)
-        vim.schedule(function()
-            local data, err = parse_response(result.stdout, result.stderr, result.code)
-            if err then
-                callback(false, err)
+    if expected_version then
+        -- Pre-flight check: verify the remote version hasn't changed.
+        fetch_version(token, file_id, function(current_version, ver_err)
+            if ver_err then
+                callback(false, 'version check failed: ' .. ver_err)
                 return
             end
-            config.log('Uploaded to file ' .. (data.id or file_id), vim.log.levels.DEBUG)
-            callback(true, nil)
+            if current_version ~= expected_version then
+                config.log('Version mismatch: expected ' .. expected_version
+                    .. ', got ' .. (current_version or 'nil'), vim.log.levels.DEBUG)
+                callback(false, 'version_mismatch')
+                return
+            end
+            do_upload()
         end)
-    end)
+    else
+        do_upload()
+    end
 end
 
 --- Create a new file on Google Drive.
@@ -344,7 +386,7 @@ end
 
 --- Download the dooing file from Google Drive.
 --- Handles token acquisition, file lookup, and download in one call.
---- @param callback fun(content: string|nil, etag: string|nil, err: string|nil)
+--- @param callback fun(content: string|nil, version: string|nil, err: string|nil)
 function M.pull(callback)
     M.get_access_token(function(token, err)
         if err then callback(nil, nil, err); return end
@@ -368,21 +410,21 @@ end
 
 --- Upload content to the dooing file on Google Drive.
 --- Creates the file if it doesn't exist.
---- Supports conditional upload via ETag to prevent lost updates.
---- @param content string                  JSON string to upload.
---- @param etag_or_cb string|function|nil  ETag for conditional upload, or callback (backward compat).
+--- Supports conditional upload via version check to prevent lost updates.
+--- @param content string                      JSON string to upload.
+--- @param version_or_cb string|function|nil   Expected version for conditional upload, or callback (backward compat).
 --- @param callback fun(ok: boolean, err: string|nil)|nil
-function M.push(content, etag_or_cb, callback)
+function M.push(content, version_or_cb, callback)
     -- Backward compatible: push(content, callback) still works.
-    local etag = nil
-    if type(etag_or_cb) == 'function' then
-        callback = etag_or_cb
+    local expected_version = nil
+    if type(version_or_cb) == 'function' then
+        callback = version_or_cb
     else
-        etag = etag_or_cb
+        expected_version = version_or_cb
     end
 
-    if etag then
-        config.log('Pushing with ETag: ' .. etag, vim.log.levels.DEBUG)
+    if expected_version then
+        config.log('Pushing with expected version: ' .. expected_version, vim.log.levels.DEBUG)
     end
 
     M.get_access_token(function(token, err)
@@ -396,7 +438,7 @@ function M.push(content, etag_or_cb, callback)
                 callback(true, nil)
                 return
             end
-            M.upload(token, file_id, content, etag, callback)
+            M.upload(token, file_id, content, expected_version, callback)
         end)
     end)
 end
@@ -436,7 +478,7 @@ end
 --- @private
 M._testing = {
     parse_response = parse_response,
-    parse_etag_from_headers = parse_etag_from_headers,
+    fetch_version = fetch_version,
     curl_cmd = curl_cmd,
     --- Reset cached file ID (for tests that switch filenames).
     reset_cached_file_id = function() cached_file_id = nil end,
