@@ -401,12 +401,47 @@ function M.push(content, etag_or_cb, callback)
     end)
 end
 
+--- Delete a file from Google Drive (permanently).
+--- @param token string     Access token.
+--- @param file_id string   Drive file ID.
+--- @param callback fun(ok: boolean, err: string|nil)
+function M.delete_file(token, file_id, callback)
+    local cmd = curl_cmd({
+        '-X', 'DELETE',
+        '-H', 'Authorization: Bearer ' .. token,
+        'https://www.googleapis.com/drive/v3/files/' .. file_id,
+    })
+
+    vim.system(cmd, { text = true }, function(result)
+        vim.schedule(function()
+            if result.code ~= 0 then
+                callback(false, 'curl failed (exit ' .. result.code .. ')')
+                return
+            end
+            -- Successful DELETE returns 204 No Content (empty body).
+            if result.stdout and result.stdout ~= '' then
+                local _, err = parse_response(result.stdout, result.stderr, result.code)
+                if err then
+                    callback(false, err)
+                    return
+                end
+            end
+            config.log('Deleted file ' .. file_id, vim.log.levels.DEBUG)
+            callback(true, nil)
+        end)
+    end)
+end
+
 --- Expose internals for testing.
 --- @private
 M._testing = {
     parse_response = parse_response,
     parse_etag_from_headers = parse_etag_from_headers,
     curl_cmd = curl_cmd,
+    --- Reset cached file ID (for tests that switch filenames).
+    reset_cached_file_id = function() cached_file_id = nil end,
+    --- Get cached file ID (for test cleanup).
+    get_cached_file_id = function() return cached_file_id end,
 }
 
 return M

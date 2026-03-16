@@ -367,9 +367,12 @@ test('concurrent sync call is skipped', function()
     local done2 = false
     dooing_sync.sync({ on_done = function() done2 = true end })
 
-    -- Second should complete immediately (skipped).
-    wait(500, function() return done2 end)
+    -- Second should complete immediately (skipped) because sync_in_progress is
+    -- set eagerly before the async lock callback fires.
     assert(done2, 'second sync should complete immediately (skipped)')
+
+    -- Wait for the async lock callback to fire so do_sync runs and calls pull.
+    wait(500, function() return mock.pull_calls >= 1 end)
     assert(not done1, 'first sync should still be in progress')
     assert(mock.pull_calls == 1, 'only one pull should have been made')
 

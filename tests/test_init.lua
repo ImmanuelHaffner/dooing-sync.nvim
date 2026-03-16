@@ -64,8 +64,11 @@ if not has_creds then
 end
 
 -------------------------------------------------------------------------------
--- Setup with a temporary save_path so we don't touch real dooing data.
+-- Setup with a temporary save_path and a dedicated test filename on Drive
+-- so we never touch the user's real data.
 -------------------------------------------------------------------------------
+
+local TEST_FILENAME = 'dooing_todos_TEST.json'
 
 local test_dir = '/tmp/dooing_sync_init_test_' .. os.time()
 os.execute('mkdir -p ' .. test_dir)
@@ -92,6 +95,7 @@ test('setup completes without error', function()
     dooing_sync.setup({
         save_path = test_save_path,
         base_path = test_base_path,
+        gdrive_filename = TEST_FILENAME,
         debug = false,
         sync = {
             sync_on_open = true,
@@ -103,7 +107,11 @@ test('setup completes without error', function()
     local status = dooing_sync.status()
     assert(status.enabled == true, 'sync should be enabled')
 
-    -- Wait for the async initial sync to complete.
+    -- In headless mode (no UI), start_sync_engine is deferred to UIEnter.
+    -- Fire the autocmd manually to start the sync engine (watcher, timer, initial sync).
+    vim.api.nvim_exec_autocmds('UIEnter', { group = 'dooing_sync' })
+
+    -- Wait for the async sync to complete.
     wait(15000, function()
         return require('dooing-sync').status().last_sync ~= nil
     end)
@@ -128,6 +136,10 @@ puts('push-on-save via file watcher')
 -------------------------------------------------------------------------------
 
 test('file write triggers push to Drive', function()
+    -- Ensure at least 1 second has elapsed since last sync so os.time() advances.
+    local prev_sync = require('dooing-sync').status().last_sync or 0
+    wait(1500, function() return os.time() > prev_sync end)
+
     -- Modify the local file (simulate dooing saving).
     local new_data = {
         { id = 'init_test_1', text = 'Init test item 1', done = false, created_at = os.time() - 100 },
@@ -139,9 +151,8 @@ test('file write triggers push to Drive', function()
     file:write(vim.json.encode(new_data, { sort_keys = true }))
     file:close()
 
-    -- Wait for debounce + async push.
-    local prev_sync = require('dooing-sync').status().last_sync or 0
-    wait(5000, function()
+    -- Wait for debounce (500ms) + async lock + network push.
+    wait(15000, function()
         local s = require('dooing-sync').status()
         return s.last_sync and s.last_sync > prev_sync
     end)
@@ -244,6 +255,26 @@ end)
 -------------------------------------------------------------------------------
 puts('')
 -------------------------------------------------------------------------------
+
+-- Clean up test file from Drive (best-effort).
+-- Reuse the already-loaded gdrive module to avoid stale module side-effects.
+local function cleanup_test_file()
+    local gdrive = require('dooing-sync.gdrive')
+    local file_id = gdrive._testing.get_cached_file_id()
+    if not file_id then return end
+
+    local done = false
+    gdrive.get_access_token(function(token, err)
+        if err or not token then done = true; return end
+        gdrive.delete_file(token, file_id, function()
+            gdrive._testing.reset_cached_file_id()
+            done = true
+        end)
+    end)
+    wait(10000, function() return done end)
+end
+cleanup_test_file()
+puts('  ✓ test file cleaned up from Drive')
 
 -- Clean up test directory.
 os.execute('rm -rf ' .. test_dir)

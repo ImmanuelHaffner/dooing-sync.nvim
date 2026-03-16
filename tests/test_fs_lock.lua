@@ -235,6 +235,106 @@ end)
 
 -------------------------------------------------------------------------------
 puts('')
+puts('lock_async()')
+-------------------------------------------------------------------------------
+
+test('A1: lock_async acquires and unlock round-trip', function()
+    reset()
+    local result = nil
+    fs.lock_async(2000, function(acquired) result = acquired end)
+    vim.wait(2000, function() return result ~= nil end, 10)
+    assert(result == true, 'should acquire lock asynchronously')
+    assert(fs._testing.is_lock_held() == true, 'lock_held should be true')
+    -- Lockfile should exist.
+    local f = io.open(fs._testing.lock_path(), 'r')
+    assert(f ~= nil, 'lockfile should exist')
+    f:close()
+    -- Unlock.
+    assert(fs.unlock() == true, 'should release lock')
+end)
+
+test('A2: lock_async writes our PID', function()
+    reset()
+    local result = nil
+    fs.lock_async(2000, function(acquired) result = acquired end)
+    vim.wait(2000, function() return result ~= nil end, 10)
+    assert(result == true)
+    local pid = fs._testing.read_pid(fs._testing.lock_path())
+    assert(pid == vim.uv.os_getpid(), 'lockfile should contain our PID')
+    fs.unlock()
+end)
+
+test('A3: lock_async removes stale lock from dead PID', function()
+    reset()
+    local lpath = fs._testing.lock_path()
+    local f = io.open(lpath, 'w')
+    f:write('99999999')
+    f:close()
+    local result = nil
+    fs.lock_async(2000, function(acquired) result = acquired end)
+    vim.wait(2000, function() return result ~= nil end, 10)
+    assert(result == true, 'should acquire after removing stale lock')
+    local pid = fs._testing.read_pid(lpath)
+    assert(pid == vim.uv.os_getpid(), 'should now contain our PID')
+    fs.unlock()
+end)
+
+test('A4: lock_async times out when held by a live process', function()
+    reset()
+    local lpath = fs._testing.lock_path()
+    local f = io.open(lpath, 'w')
+    f:write('1') -- PID 1 is always alive
+    f:close()
+    local result = nil
+    local start = vim.uv.hrtime()
+    fs.lock_async(300, function(acquired) result = acquired end)
+    vim.wait(2000, function() return result ~= nil end, 10)
+    local elapsed_ms = (vim.uv.hrtime() - start) / 1e6
+    assert(result == false, 'should fail to acquire')
+    assert(elapsed_ms >= 250, 'should have waited near the timeout')
+    -- Clean up.
+    os.remove(lpath)
+end)
+
+test('A5: lock_async reentrancy guard returns true', function()
+    reset()
+    -- Acquire synchronously first.
+    assert(fs.lock(2000) == true)
+    -- Async reentrant attempt should return true via callback.
+    local result = nil
+    fs.lock_async(2000, function(acquired) result = acquired end)
+    vim.wait(2000, function() return result ~= nil end, 10)
+    assert(result == true, 'reentrant lock_async should return true')
+    fs.unlock()
+end)
+
+test('A6: lock_async with timeout_ms=0 disables locking', function()
+    reset()
+    local result = nil
+    fs.lock_async(0, function(acquired) result = acquired end)
+    vim.wait(2000, function() return result ~= nil end, 10)
+    assert(result == true, 'should succeed immediately')
+    assert(fs._testing.is_lock_held() == true)
+    local f = io.open(fs._testing.lock_path(), 'r')
+    assert(f == nil, 'no lockfile when locking disabled')
+    fs.unlock()
+end)
+
+test('A7: lock_async reacquires own lockfile', function()
+    reset()
+    local lpath = fs._testing.lock_path()
+    local f = io.open(lpath, 'w')
+    f:write(tostring(vim.uv.os_getpid()))
+    f:close()
+    local result = nil
+    fs.lock_async(2000, function(acquired) result = acquired end)
+    vim.wait(2000, function() return result ~= nil end, 10)
+    assert(result == true, 'should reacquire own lock')
+    fs.unlock()
+end)
+
+-------------------------------------------------------------------------------
+puts('')
 -------------------------------------------------------------------------------
 
 -- Clean up test directory.

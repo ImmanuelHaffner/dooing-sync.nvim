@@ -173,6 +173,88 @@ function M.lock(timeout_ms)
     return false
 end
 
+--- Acquire the sync lock asynchronously (non-blocking).
+---
+--- Same semantics as lock() but uses a uv_timer to poll instead of vim.wait(),
+--- so the main thread is never blocked.
+---
+--- @param timeout_ms integer|nil  Maximum time to wait (default from config).
+--- @param callback fun(acquired: boolean)  Called once with the result.
+function M.lock_async(timeout_ms, callback)
+    if lock_held then
+        config.log('BUG: lock_async() called while already holding lock', vim.log.levels.ERROR)
+        vim.schedule(function() callback(true) end) -- Avoid deadlock.
+        return
+    end
+
+    timeout_ms = timeout_ms or config.options.lock_timeout_ms
+    if timeout_ms <= 0 then
+        -- Locking disabled.
+        lock_held = true
+        vim.schedule(function() callback(true) end)
+        return
+    end
+
+    local lpath = lock_path()
+    local my_pid = vim.uv.os_getpid()
+    local deadline = vim.uv.hrtime() + timeout_ms * 1e6
+    local timer = vim.uv.new_timer()
+
+    local function try_acquire()
+        if vim.uv.hrtime() >= deadline then
+            timer:stop()
+            timer:close()
+            vim.schedule(function()
+                config.log('Failed to acquire sync lock after ' .. timeout_ms .. 'ms', vim.log.levels.WARN)
+                callback(false)
+            end)
+            return
+        end
+
+        local fd, _, err_name = vim.uv.fs_open(lpath, 'wx', 420) -- O_WRONLY|O_CREAT|O_EXCL, 0644
+
+        if fd then
+            vim.uv.fs_write(fd, tostring(my_pid))
+            vim.uv.fs_close(fd)
+            lock_held = true
+            timer:stop()
+            timer:close()
+            vim.schedule(function()
+                config.log('Lock acquired (PID ' .. my_pid .. ')', vim.log.levels.DEBUG)
+                callback(true)
+            end)
+            return
+        end
+
+        -- Lockfile exists. Check if the owner is still alive.
+        local owner_pid = read_pid(lpath)
+        if owner_pid and owner_pid == my_pid then
+            lock_held = true
+            timer:stop()
+            timer:close()
+            vim.schedule(function()
+                config.log('Reacquired own lock (PID ' .. my_pid .. ')', vim.log.levels.DEBUG)
+                callback(true)
+            end)
+            return
+        elseif owner_pid and not process_alive(owner_pid) then
+            -- Schedule the log since we may be in a timer callback (fast event context).
+            vim.schedule(function()
+                config.log('Removing stale lock from PID ' .. owner_pid, vim.log.levels.WARN)
+            end)
+            vim.uv.fs_unlink(lpath)
+            -- Don't return — let the next timer tick try again immediately.
+        end
+        -- Otherwise: lock held by a live process, timer will retry on next tick.
+    end
+
+    -- First attempt immediately, then poll every 100ms.
+    try_acquire()
+    if not lock_held then
+        timer:start(100, 100, try_acquire)
+    end
+end
+
 --- Release the sync lock.
 ---
 --- Verifies ownership (PID matches) before removing the lockfile.

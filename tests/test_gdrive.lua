@@ -49,7 +49,9 @@ package.loaded['dooing-sync.config'] = nil
 package.loaded['dooing-sync.gdrive'] = nil
 
 local config = require('dooing-sync.config')
-config.setup({ debug = false })
+-- Use a dedicated test filename so we never touch the user's real data.
+local TEST_FILENAME = 'dooing_todos_TEST.json'
+config.setup({ debug = false, gdrive_filename = TEST_FILENAME })
 
 local has_creds, missing = config.has_credentials()
 if not has_creds then
@@ -62,6 +64,23 @@ if not has_creds then
 end
 
 local gdrive = require('dooing-sync.gdrive')
+-- Ensure we start with a clean cached file ID.
+gdrive._testing.reset_cached_file_id()
+
+--- Helper: delete the test file from Drive (best-effort cleanup).
+local function cleanup_test_file()
+    local file_id = gdrive._testing.get_cached_file_id()
+    if not file_id then return end
+    local done = false
+    gdrive.get_access_token(function(token, err)
+        if err or not token then done = true; return end
+        gdrive.delete_file(token, file_id, function()
+            gdrive._testing.reset_cached_file_id()
+            done = true
+        end)
+    end)
+    wait(10000, function() return done end)
+end
 
 -------------------------------------------------------------------------------
 puts('gdrive token management')
@@ -173,6 +192,15 @@ test('push then pull round-trip', function()
     assert(pulled[1].text == 'Integration test item', 'content mismatch')
     assert(pull_etag ~= nil, 'pull should return etag')
 end)
+
+-------------------------------------------------------------------------------
+puts('')
+puts('cleanup')
+-------------------------------------------------------------------------------
+
+-- Delete the test file from Drive so we don't leave garbage behind.
+cleanup_test_file()
+puts('  ✓ test file cleaned up from Drive')
 
 -------------------------------------------------------------------------------
 puts('')

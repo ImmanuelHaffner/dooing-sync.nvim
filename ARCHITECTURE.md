@@ -204,8 +204,14 @@ push to Drive.
   `kill(pid, 0)`. If the process is dead, the lock is removed and reacquired.
 - **Timeout**: Configurable via `lock_timeout_ms` (default: 10s). On timeout, the sync
   is skipped — the next trigger will retry.
-- **Reentrancy guard**: A module-local `sync_in_progress` flag in `init.lua` prevents
-  reentrant sync attempts (e.g. file watcher firing during an ongoing sync).
+- **Async vs blocking**: Two lock functions in `fs.lua`:
+  - `lock_async(timeout_ms, callback)` — non-blocking, uses a `uv_timer` to poll every
+    100ms. Used by all normal sync paths (startup, file watcher, periodic pull, manual).
+  - `lock(timeout_ms)` — blocking, uses `vim.wait()`. Only used by `VimLeavePre` where
+    we must complete before Neovim exits.
+- **Reentrancy guard**: A module-local `sync_in_progress` flag in `init.lua` (set eagerly
+  before the async lock callback) prevents reentrant sync attempts (e.g. file watcher
+  firing during an ongoing sync).
 
 #### Layer 2: ETag-Based Conditional Push
 
@@ -236,10 +242,11 @@ There is no "push-only" code path. Every push goes through the full three-way me
 
 ## Synchronization Flow
 
-### Startup Sync (Blocking)
+### Startup Sync (Non-blocking)
 
-This runs during `dooing-sync.setup()`, **before** `dooing.setup()`, so dooing loads
-the already-merged data.
+This runs during `dooing-sync.setup()` (or on `UIEnter` if no UI is attached yet).
+Lock acquisition and network I/O are fully asynchronous — the main thread is never
+blocked, so Neovim remains responsive during the initial sync.
 
 ```
  dooing-sync.setup()
@@ -249,9 +256,9 @@ the already-merged data.
  │
  ├─ Resolve save_path
  │
- ├─ INITIAL SYNC (blocking via vim.wait)
+ ├─ INITIAL SYNC (async — non-blocking)
  │  │
- │  ├─ 1. Acquire local lock
+ │  ├─ 1. Acquire local lock (async via uv_timer polling)
  │  │
  │  ├─ 2. Load base snapshot + local file (under lock)
  │  │
@@ -319,12 +326,13 @@ Triggered by a repeating timer (default: every 5 minutes). Uses the same full sy
 
 ### VimLeavePre Flow
 
-Ensures data is synced before Neovim exits. Uses a blocking full sync cycle.
+Ensures data is synced before Neovim exits. This is the **only blocking** sync path —
+it uses the synchronous `fs.lock()` + `vim.wait()` to guarantee completion before exit.
 
 ```
  VimLeavePre
  │
- └─ Full sync cycle (blocking, up to 15s timeout)
+ └─ Full sync cycle (blocking lock + vim.wait, up to sync_on_close_timeout_ms)
 ```
 
 ---

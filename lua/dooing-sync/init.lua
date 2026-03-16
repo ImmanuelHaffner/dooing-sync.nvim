@@ -74,32 +74,32 @@ function M.sync(opts)
         return
     end
 
-    -- Acquire local lock (serializes with other Neovim sessions on this machine).
-    if not fs.lock() then
-        config.log('Could not acquire sync lock, skipping', vim.log.levels.WARN)
-        if opts.on_done then opts.on_done() end
-        return
-    end
+    --- The core sync body, called once the lock is acquired.
+    --- sync_in_progress is already true at this point (set eagerly above).
+    local function do_sync()
+        --- Release lock, clear in-progress flag, and call on_done.
+        --- Every exit path from this point MUST call finish().
+        local function finish()
+            sync_in_progress = false
+            fs.unlock()
+            if opts.on_done then opts.on_done() end
+        end
 
-    sync_in_progress = true
+        -- Guard: teardown() may have run while we waited for the async lock.
+        if not sync_enabled or not save_path then
+            finish()
+            return
+        end
 
-    --- Release lock, clear in-progress flag, and call on_done.
-    --- Every exit path from this point MUST call finish().
-    local function finish()
-        sync_in_progress = false
-        fs.unlock()
-        if opts.on_done then opts.on_done() end
-    end
+        config.log('Starting sync'
+            .. (retry_count > 0 and (' (retry ' .. retry_count .. ')') or '')
+            .. '...', vim.log.levels.DEBUG)
 
-    config.log('Starting sync'
-        .. (retry_count > 0 and (' (retry ' .. retry_count .. ')') or '')
-        .. '...', vim.log.levels.DEBUG)
+        -- Read local state under lock (before network I/O).
+        local base_data  = fs.load_base()
+        local local_data = fs.read_json(save_path) or {}
 
-    -- Read local state under lock (before network I/O).
-    local base_data  = fs.load_base()
-    local local_data = fs.read_json(save_path) or {}
-
-    gdrive.pull(function(remote_content, etag, pull_err)
+        gdrive.pull(function(remote_content, etag, pull_err)
         if pull_err then
             config.log('Pull failed: ' .. pull_err, vim.log.levels.WARN)
             finish()
@@ -164,6 +164,7 @@ function M.sync(opts)
                     sync_in_progress = false
                     fs.unlock()
                     M.sync({
+                        blocking = opts.blocking,
                         on_done = opts.on_done,
                         _retry_count = retry_count + 1,
                     })
@@ -186,7 +187,35 @@ function M.sync(opts)
             config.log('Remote already up-to-date, skipping push', vim.log.levels.DEBUG)
             finish()
         end
-    end)
+        end)
+    end
+
+    -- Mark in-progress eagerly so a second M.sync() call before the async lock
+    -- callback fires is correctly rejected by the guard at the top.
+    sync_in_progress = true
+
+    -- Acquire local lock (serializes with other Neovim sessions on this machine).
+    if opts.blocking then
+        -- Blocking lock — used by VimLeavePre where we must finish before exit.
+        if not fs.lock() then
+            sync_in_progress = false
+            config.log('Could not acquire sync lock, skipping', vim.log.levels.WARN)
+            if opts.on_done then opts.on_done() end
+            return
+        end
+        do_sync()
+    else
+        -- Async lock — never blocks the main thread.
+        fs.lock_async(nil, function(acquired)
+            if not acquired then
+                sync_in_progress = false
+                config.log('Could not acquire sync lock, skipping', vim.log.levels.WARN)
+                if opts.on_done then opts.on_done() end
+                return
+            end
+            do_sync()
+        end)
+    end
 end
 
 -------------------------------------------------------------------------------
@@ -285,7 +314,7 @@ local function register_autocmds()
                 if not sync_enabled or not has_ui() then return end
                 config.log('Final sync before exit...', vim.log.levels.DEBUG)
                 local done = false
-                M.sync({ on_done = function() done = true end })
+                M.sync({ blocking = true, on_done = function() done = true end })
                 local timeout = config.options.sync.sync_on_close_timeout_ms or 3000
                 vim.wait(timeout, function() return done end, 50)
             end,
