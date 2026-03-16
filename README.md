@@ -33,12 +33,11 @@ set up **before** dooing so the initial sync runs first.
         'ImmanuelHaffner/dooing-sync.nvim',
     },
     config = function()
-        -- Sync setup FIRST: pulls from Google Drive, merges, writes to save_path.
+        -- Order doesn't matter — sync is async and reloads dooing when done.
         require('dooing-sync').setup({
             gdrive_folder_id = 'YOUR_FOLDER_ID',  -- optional: store in a specific Drive folder
         })
 
-        -- Dooing setup SECOND: loads the now-current JSON.
         require('dooing').setup({
             -- your dooing options
         })
@@ -142,10 +141,12 @@ require('dooing-sync').setup({
         refresh_token = 'DOOING_GDRIVE_REFRESH_TOKEN',
     },
 
-    -- Sync behavior.
+    -- Sync behavior (all skipped in headless mode — no UI attached).
     sync = {
-        pull_on_start = true,   -- pull from Drive on setup
+        sync_on_open  = true,   -- async background sync on UIEnter
         push_on_save  = true,   -- push after every dooing save
+        sync_on_close = true,   -- sync before exiting (VimLeavePre)
+        sync_on_close_timeout_ms = 3000,  -- max exit sync wait (ms)
         pull_interval = 300,    -- periodic pull in seconds (0 = disabled)
     },
 

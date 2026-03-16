@@ -246,20 +246,63 @@ end
 
 local augroup = nil
 
+--- Check whether a UI is attached.
+--- @return boolean
+local function has_ui()
+    return #vim.api.nvim_list_uis() > 0
+end
+
+--- Start the sync engine: initial sync, file watcher, periodic timer.
+--- Called when a UI attaches (UIEnter) or immediately if UI is already present.
+local function start_sync_engine()
+    if not sync_enabled then return end
+
+    -- Initial async sync (non-blocking: dooing keeps local data, refreshes on completion).
+    if config.options.sync.sync_on_open then
+        config.log('Starting background sync...', vim.log.levels.DEBUG)
+        M.sync()
+    end
+
+    -- Start file watcher.
+    if config.options.sync.push_on_save then
+        fs.watch(save_path, on_file_changed)
+    end
+
+    -- Start periodic pull timer.
+    start_pull_timer()
+
+    config.log('Ready', vim.log.levels.DEBUG)
+end
+
 local function register_autocmds()
     augroup = vim.api.nvim_create_augroup('dooing_sync', { clear = true })
 
-    -- Final sync on exit (synchronous to ensure it completes).
-    vim.api.nvim_create_autocmd('VimLeavePre', {
-        group = augroup,
-        callback = function()
-            if not sync_enabled then return end
-            config.log('Final sync before exit...', vim.log.levels.DEBUG)
-            local done = false
-            M.sync({ on_done = function() done = true end })
-            vim.wait(15000, function() return done end, 50)
-        end,
-    })
+    -- Final sync on exit (short blocking wait to flush pending changes).
+    if config.options.sync.sync_on_close then
+        vim.api.nvim_create_autocmd('VimLeavePre', {
+            group = augroup,
+            callback = function()
+                if not sync_enabled or not has_ui() then return end
+                config.log('Final sync before exit...', vim.log.levels.DEBUG)
+                local done = false
+                M.sync({ on_done = function() done = true end })
+                local timeout = config.options.sync.sync_on_close_timeout_ms or 3000
+                vim.wait(timeout, function() return done end, 50)
+            end,
+        })
+    end
+
+    -- Defer sync engine start until a UI attaches (skips headless mode).
+    if not has_ui() then
+        vim.api.nvim_create_autocmd('UIEnter', {
+            group = augroup,
+            once = true,
+            callback = function()
+                config.log('UI attached, starting sync engine', vim.log.levels.DEBUG)
+                start_sync_engine()
+            end,
+        })
+    end
 end
 
 -------------------------------------------------------------------------------
@@ -297,7 +340,8 @@ end
 -------------------------------------------------------------------------------
 
 --- Setup dooing-sync.
---- Call this BEFORE require'dooing'.setup() so the initial sync runs first.
+--- Can be called before or after dooing.setup() — order no longer matters because
+--- the initial sync is async and dooing is reloaded when the sync completes.
 --- @param opts table|nil  User configuration (see config.lua for defaults).
 function M.setup(opts)
     config.setup(opts)
@@ -318,29 +362,15 @@ function M.setup(opts)
 
     sync_enabled = true
 
-    -- Register commands and autocmds.
+    -- Register commands and autocmds (including UIEnter if no UI yet).
     register_commands()
     register_autocmds()
 
-    -- Initial sync (blocking, so dooing loads the merged file).
-    if config.options.sync.pull_on_start then
-        local done = false
-        M.sync({ blocking = true, on_done = function() done = true end })
-        vim.wait(15000, function() return done end, 50)
-        if not done then
-            config.log('Initial sync timed out, continuing with local data', vim.log.levels.WARN)
-        end
+    -- If a UI is already attached (normal startup), start immediately.
+    -- Otherwise UIEnter autocmd (registered above) will start the engine.
+    if has_ui() then
+        start_sync_engine()
     end
-
-    -- Start file watcher.
-    if config.options.sync.push_on_save then
-        fs.watch(save_path, on_file_changed)
-    end
-
-    -- Start periodic pull timer.
-    start_pull_timer()
-
-    config.log('Ready', vim.log.levels.DEBUG)
 end
 
 --- Teardown (for testing or plugin unload).

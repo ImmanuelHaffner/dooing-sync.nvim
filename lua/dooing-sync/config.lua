@@ -23,11 +23,20 @@ M.defaults = {
     },
 
     --- Sync behavior.
+    --- All sync activity is skipped in headless mode (no UI attached).
     sync = {
-        --- Pull from Google Drive on setup (before dooing loads).
-        pull_on_start = true,
+        --- Run an async background sync when the UI attaches (UIEnter).
+        --- Dooing loads immediately with local data; merged data is applied
+        --- when the sync completes (non-blocking).
+        sync_on_open = true,
         --- Push to Google Drive after every dooing save.
         push_on_save = true,
+        --- Sync before exiting (VimLeavePre). Short blocking wait to ensure
+        --- the final push reaches Drive.
+        sync_on_close = true,
+        --- Timeout (ms) for the exit sync. Keep short to avoid slow exits.
+        --- Only relevant when sync_on_close is true.
+        sync_on_close_timeout_ms = 3000,
         --- Periodic pull interval in seconds (0 = disabled).
         pull_interval = 300,
     },

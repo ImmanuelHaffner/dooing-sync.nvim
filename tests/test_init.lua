@@ -94,18 +94,24 @@ test('setup completes without error', function()
         base_path = test_base_path,
         debug = false,
         sync = {
-            pull_on_start = true,
+            sync_on_open = true,
             push_on_save = true,
+            sync_on_close = false,
             pull_interval = 0,
         },
     })
     local status = dooing_sync.status()
     assert(status.enabled == true, 'sync should be enabled')
+
+    -- Wait for the async initial sync to complete.
+    wait(15000, function()
+        return require('dooing-sync').status().last_sync ~= nil
+    end)
 end)
 
 test('initial sync sets last_sync time', function()
     local status = require('dooing-sync').status()
-    assert(status.last_sync ~= nil, 'last_sync should be set')
+    assert(status.last_sync ~= nil, 'last_sync should be set after async sync')
     assert(os.time() - status.last_sync < 30, 'sync should be recent')
 end)
 

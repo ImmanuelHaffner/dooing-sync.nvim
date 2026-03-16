@@ -138,8 +138,9 @@ local function setup_with_mock(mock_overrides)
         max_retries = 2,
         debug = false,
         sync = {
-            pull_on_start = false,  -- We control sync calls manually.
+            sync_on_open = false,   -- We control sync calls manually.
             push_on_save = false,
+            sync_on_close = false,
             pull_interval = 0,
         },
         -- Fake credentials so sync_enabled = true.
@@ -170,8 +171,9 @@ local function setup_with_mock(mock_overrides)
         max_retries = 2,
         debug = false,
         sync = {
-            pull_on_start = false,
+            sync_on_open = false,
             push_on_save = false,
+            sync_on_close = false,
             pull_interval = 0,
         },
         env = {
