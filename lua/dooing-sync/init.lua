@@ -22,7 +22,8 @@ local last_report = nil         -- Last merge report.
 
 --- Log a merge report summary.
 --- @param report dooing_sync.MergeReport
-local function log_report(report)
+--- @param force boolean|nil  If true, always show (even routine messages).
+local function log_report(report, force)
     local parts = {}
     if report.added_local > 0  then table.insert(parts, '+' .. report.added_local .. ' local') end
     if report.added_remote > 0 then table.insert(parts, '+' .. report.added_remote .. ' remote') end
@@ -31,7 +32,7 @@ local function log_report(report)
     if report.conflicts > 0    then table.insert(parts, '!' .. report.conflicts .. ' conflicts') end
 
     if #parts == 0 then
-        config.log('Sync: no changes', vim.log.levels.INFO, { routine = true })
+        config.log('Sync: no changes', vim.log.levels.INFO, { routine = not force })
     else
         config.log('Sync: ' .. table.concat(parts, ', '), vim.log.levels.INFO)
     end
@@ -56,7 +57,7 @@ end
 --- sessions on the same machine) and ETag-based conditional push (prevents lost
 --- updates across machines).
 ---
---- @param opts { blocking: boolean, on_done: fun()|nil, _retry_count: integer|nil }|nil
+--- @param opts { blocking: boolean, manual: boolean, on_done: fun()|nil, _retry_count: integer|nil }|nil
 function M.sync(opts)
     opts = opts or {}
     local retry_count = opts._retry_count or 0
@@ -116,7 +117,7 @@ function M.sync(opts)
                 if ok then
                     fs.save_base(local_data)
                     last_sync_time = os.time()
-                    config.log('Initial push complete', vim.log.levels.INFO, { routine = true })
+                    config.log('Initial push complete', vim.log.levels.INFO, { routine = not opts.manual })
                 else
                     config.log('Initial push failed: ' .. (push_err or '?'), vim.log.levels.WARN)
                 end
@@ -128,7 +129,7 @@ function M.sync(opts)
         -- Three-way merge.
         local merged, report = merge.merge(base_data, local_data, remote_data)
         last_report = report
-        log_report(report)
+        log_report(report, opts.manual)
 
         -- Write merged result locally if it differs from current local.
         if not report.is_noop then
@@ -165,6 +166,7 @@ function M.sync(opts)
                     fs.unlock()
                     M.sync({
                         blocking = opts.blocking,
+                        manual = opts.manual,
                         on_done = opts.on_done,
                         _retry_count = retry_count + 1,
                     })
@@ -341,7 +343,7 @@ end
 local function register_commands()
     vim.api.nvim_create_user_command('DooingSync', function()
         config.log('Manual sync triggered', vim.log.levels.INFO)
-        M.sync()
+        M.sync({ manual = true })
     end, { desc = 'dooing-sync: Pull from Google Drive, merge, and push' })
 
     vim.api.nvim_create_user_command('DooingSyncStatus', function()
